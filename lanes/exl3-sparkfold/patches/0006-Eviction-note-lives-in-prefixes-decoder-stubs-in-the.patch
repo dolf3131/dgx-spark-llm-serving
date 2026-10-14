@@ -1,0 +1,75 @@
+From c6c77df73553e5a532b833c401f6c2e1901ac3ce Mon Sep 17 00:00:00 2001
+From: dolf3131 <144650661+dolf3131@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 13:40:32 +0900
+Subject: [PATCH 6/7] Eviction note lives in prefixes (decoder stubs in the
+ host tests have no gate); spill check tooling
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/tensorfold/families/qwen4_exp/cuda/multi.py   | 15 +++------------
+ .../families/qwen4_exp/cuda/prefixes.py           | 14 ++++++++++++++
+ 2 files changed, 17 insertions(+), 12 deletions(-)
+
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/multi.py b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+index b069732..59f1754 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/multi.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+@@ -207,16 +207,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+             self.memory_gate.give(-st.resize(min(FIRST, st.limit)))
+ 
+     def _evict_note(self, what: str, need: int) -> None:
+-        """Say why a kept conversation went: the memory gate refused ``need`` bytes (host MemAvailable less the floor on a unified GPU)."""
+-
+-        if self.planning:                            # two ranks plan on copies; only the real decoder speaks
+-            return
+-        gate = self.memory_gate
+-        live = gate.live() if gate.live is not None else None
+-        seen = f"{live / 2**30:.1f} GiB" if live is not None else "n/a"
+-        print(f"[tensorfold] memory gate evicted {what} to grow a cache by {need / 2**30:.2f} GiB: free over the floor {seen}, "
+-              f"needs that plus {gate.reserve / 2**30:.1f} GiB; held by streams {gate.held / 2**30:.1f} of {gate.room / 2**30:.1f} GiB "
+-              f"(TENSORFOLD_MEMORY_RESERVE_GIB moves the floor)", flush=True)
++        prefixes.evict_note(self, what, need)
+ 
+     def _evict_kept(self, keep: State, *, protect: State | None = None, need: int = 0) -> bool:
+         """Free the oldest idle kept prompt end (never ``keep``); False when none is left."""
+@@ -229,13 +220,13 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+                 self._shrink(st, release=True)
+                 if all(f is not st for f in self.free):
+                     self.free.append(st)
+-                self._evict_note(f"a {len(ids)}-token kept state", need)
++                prefixes.evict_note(self, f"a {len(ids)}-token kept state", need)
+                 return True
+         solo = None if self.solo is None else self.solo.st
+         if (solo is not None and solo is not keep and solo is not protect
+                 and id(solo) not in busy and solo.capacity > FIRST):
+             self._shrink(solo, release=True)
+-            self._evict_note("the lone-stream graph slot's caches", need)
++            prefixes.evict_note(self, "the lone-stream graph slot's caches", need)
+             return True
+         return False
+ 
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/prefixes.py b/src/tensorfold/families/qwen4_exp/cuda/prefixes.py
+index f08356a..7dd0849 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/prefixes.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/prefixes.py
+@@ -103,6 +103,20 @@ def _claim(owner, best, busy):
+     return slots[min(idle)[3]] if idle else None
+ 
+ 
++def evict_note(owner, what: str, need: int) -> None:
++    """Say why the memory gate dropped a kept conversation: it refused ``need`` bytes (host MemAvailable less the floor on a unified GPU)."""
++
++    gate = getattr(owner, "memory_gate", None)
++    if gate is None or getattr(owner, "planning", False):      # two ranks plan on copies; only the real decoder speaks
++        return
++    live = gate.live() if gate.live is not None else None
++    seen = f"{live / 2**30:.1f} GiB" if live is not None else "n/a"
++    gib = 2**30
++    print(f"[tensorfold] memory gate evicted {what} to grow a cache by {need / gib:.2f} GiB: free over the floor {seen}, "
++          f"needs that plus {gate.reserve / gib:.1f} GiB; held by streams {gate.held / gib:.1f} of {gate.room / gib:.1f} GiB "
++          f"(TENSORFOLD_MEMORY_RESERVE_GIB moves the floor)", flush=True)
++
++
+ def spill_slot(owner, st) -> None:
+     """TF_SPILL_DIR: before an idle slot's kept states are dropped, write its longest one to disk (never raises, never blocks a drop forever)."""
+ 

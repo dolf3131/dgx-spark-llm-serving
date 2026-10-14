@@ -1,0 +1,521 @@
+diff --git a/src/tensorfold/cuda/reply_text.py b/src/tensorfold/cuda/reply_text.py
+index 4ba4c41..a47f1ef 100644
+--- a/src/tensorfold/cuda/reply_text.py
++++ b/src/tensorfold/cuda/reply_text.py
+@@ -18,6 +18,15 @@ _TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parame
+ 
+ 
+ 
++_DOUBLE_OPEN_RE = re.compile(r"(?:<tool_call>\s*){2,}", re.IGNORECASE)
++
++
++def collapse_call_openers(text: str) -> str:
++    """A reply that opens ``<tool_call>`` twice in a row (a model slip) read as one opening, as the parsers expect."""
++
++    return _DOUBLE_OPEN_RE.sub("<tool_call>\n", text)
++
++
+ def _partial_tag(text: str, tag: str) -> int:
+     for k in range(min(len(tag) - 1, len(text)), 0, -1):
+         if text.endswith(tag[:k]):
+@@ -98,7 +107,10 @@ def _tool_name(tool: dict[str, Any]) -> str:
+ 
+ 
+ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int | None = None) -> tuple[str, list[dict[str, Any]] | None]:
+-    """Qwen ``<function=name><parameter=k>v</parameter></function>``, GLM ``name<arg_key>..`` or JSON calls."""
++    """Qwen ``<function=name><parameter=k>v</parameter></function>``, GLM ``name<arg_key>..`` or JSON calls.
++
++    A well-formed call to a name no tool declares (``<function=function>``) comes back as a call under its own name (``call_name``), not as
++    text, so the client answers it with an error and the model can correct itself instead of the turn ending on the raw block."""
+ 
+     if not tools:
+         return text, None
+diff --git a/src/tensorfold/cuda/server.py b/src/tensorfold/cuda/server.py
+index 04c4503..c485f25 100644
+--- a/src/tensorfold/cuda/server.py
++++ b/src/tensorfold/cuda/server.py
+@@ -27,7 +27,7 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
+ 
+ from tensorfold.cuda import health
+ from tensorfold.cuda.chat_template import ChatTemplate
+-from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, hide_tool_calls, parse_tool_calls
++from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, collapse_call_openers, hide_tool_calls, parse_tool_calls
+ from tensorfold.cuda.turns import Turns, Yield
+ from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
+ from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
+@@ -52,6 +52,7 @@ class PreparedRequest:
+     vision: Any = None
+     grammar: Any = None     # (spec, compiled grammar) of the request's response_format, or None
+     think_budget: int = 0   # reply tokens before the server closes a think block the reply leaves open (0: no limit)
++    defused: bool = False   # the prompt quotes a reserved token string, written with a zero-width space: the reply's copies are written back
+     effort: str = "none"    # the reasoning effort the template hears ("none": not thinking, or none named)
+     request_id: str = ""    # the reply's id, set by the HTTP handler, so the server's lines match what the client got
+ 
+@@ -261,10 +262,16 @@ class App:
+             if not hasattr(self, "_probability_decoder"):
+                 self._probability_decoder = TokenBytes(self.tok)
+         compiled = (spec, self._grammars().compile(spec)) if spec is not None else None
++        defused = False
+         if chat:
+             if not isinstance(body.get("messages"), list):
+                 raise RequestError("messages must be a list")
+-            from tensorfold.server.prompts import has_images, prepare_images
++            from tensorfold.server.prompts import defuse_special_tokens, has_images, prepare_images
++
++            # text that quotes a reserved token string (a fetched page, a source file) is plain text to the tokenizer, not the special token
++            messages, shown = defuse_special_tokens(body["messages"]), defuse_special_tokens(tools)
++            defused = messages is not body["messages"] or shown is not tools
++            tools = shown
+ 
+             def render(messages: list[dict[str, Any]], **images: bool) -> str:   # text renders as it always has
+                 try:
+@@ -273,15 +280,16 @@ class App:
+                 except TemplateError as exc:     # the checkpoint's template refuses the request (``raise_exception``)
+                     raise RequestError(f"the chat template rejected the request: {exc}") from exc
+ 
+-            if has_images(body["messages"]):
+-                rendered = prepare_images(self.vision, body["messages"],
++            if has_images(messages):
++                rendered = prepare_images(self.vision, messages,
+                                           lambda messages: render(messages, allow_images=True),
+                                           context_limit=self._context_limit(),
+                                           limits=getattr(self, "image_limits", DEFAULT_LIMITS))
+                 return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
+                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
+-                                       vision=rendered.vision, grammar=compiled, think_budget=budget, effort=heard)
+-            text = render(body["messages"])
++                                       vision=rendered.vision, grammar=compiled, think_budget=budget, defused=defused,
++                                       effort=heard)
++            text = render(messages)
+             prompt = self.tok.encode(text, add_special_tokens=False).ids
+         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
+             prompt = self.token_ids(body["prompt"])
+@@ -294,7 +302,8 @@ class App:
+             raise RequestError("rendered prompt is empty")
+         # sampling is resolved here, so a malformed control is refused before a stream opens
+         return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
+-                               ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget, effort=heard)
++                               ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget,
++                               defused=defused, effort=heard)
+ 
+     def token_ids(self, value: Any, field: str = "prompt") -> list[int]:
+         """Token ids as a request gives them (a list, or a list holding one list); RequestError outside the
+@@ -430,6 +439,13 @@ class App:
+         calls_stream = ToolCallStreamer(tools) if tools and not policy.single else None
+         answer_raw = [""]
+ 
++        from tensorfold.server.prompts import RestoredCallDeltas, restore_special_tokens
++
++        def restore(text: str, finished: bool, tools: bool = True) -> str:
++            return restore_special_tokens(text, finished, tools) if prepared.defused else text
++
++        call_deltas = RestoredCallDeltas() if prepared.defused else None
++
+         def visible(finished: bool) -> tuple[str, str]:
+             raw = stream.final() if finished else stream.text
+             # stop strings match the generated text, reasoning included, before it is split (as on the Mac)
+@@ -438,11 +454,15 @@ class App:
+                 reasoning, answer = split_thinking(raw, finished=finished)
+             else:
+                 reasoning, answer = "", raw
++            # restored after the split; the answer keeps its escaped <tool_call> until the call parsers have read it
++            reasoning, answer = restore(reasoning, finished), restore(answer, finished, tools=False)
++            if tools:
++                answer = collapse_call_openers(answer)          # a doubled <tool_call> is one opening for the parsers
+             answer_raw[0] = answer
+             if tools:
+                 answer = (policy.content(answer, finished=finished) if policy.single
+                           else hide_tool_calls(answer, finished=finished))
+-            return reasoning, answer
++            return reasoning, restore(answer, finished)
+ 
+         serving: list[Any] = [None]
+ 
+@@ -475,7 +495,9 @@ class App:
+                     stopped["client"] = True
+                 if calls_stream is not None and not stopped["client"]:
+                     for call_delta in calls_stream.feed(answer_raw[0]):   # never the reasoning
+-                        if not emit(call_delta):
++                        if call_deltas is not None:
++                            call_delta = call_deltas(call_delta)
++                        if call_delta is not None and not emit(call_delta):
+                             stopped["client"] = True
+                             break
+                 if not stopped["client"] and cancelled is not None and cancelled():   # every round, text or not
+@@ -572,8 +594,22 @@ class App:
+         raw_text = self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False)
+         text = stops.visible(raw_text)
+         raw_answer = split_thinking(text, finished=True)[1] if chat and thinking else text
++        raw_answer = restore(raw_answer, True, tools=False)          # after the split, before the calls are read
++        if tools:
++            opened = collapse_call_openers(raw_answer)
++            if opened != raw_answer:
++                print("[tensorfold] warning: a reply opened <tool_call> twice in a row; read as one call", flush=True)
++            raw_answer = opened
+         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
+-        content = policy.parsed_content(content) if tools else content
++        if calls:
++            declared = {str((t.get("function") or t).get("name") or "").strip().lower() for t in tools}
++            for call in calls:
++                if call["function"]["name"].lower() not in declared:
++                    print(f"[tensorfold] warning: a reply called the undeclared tool {call['function']['name']!r}; "
++                          f"returned as a call for the client to refuse", flush=True)
++        content = restore(policy.parsed_content(content) if tools else content, True)
++        for call in calls or ():
++            call["function"]["arguments"] = restore(call["function"]["arguments"], True)
+         tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
+         if tail:
+             final["content"] = tail
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/engine.py b/src/tensorfold/families/qwen4_exp/cuda/engine.py
+index 1e91f8f..bc56951 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/engine.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/engine.py
+@@ -242,6 +242,8 @@ class FlashNextEngine:
+             size = sum(lock_bytes(t) for t in tables.values())
+             # pinned pages are no longer reclaimable: lock only what the startup budget leaves room for
+             room = self.capacity_plan["budget_bytes"] - self.capacity_plan["total_bytes_estimate"]
++            # TENSORFOLD_PIN_EXTRA_GIB: pages to lock beyond that room (the startup estimate runs ahead of what is allocated)
++            room += int(float(os.environ.get("TENSORFOLD_PIN_EXTRA_GIB", "0") or 0) * 2**30)
+             for table in tables.values():
+                 if not tables_read:
+                     table.prefetch()                  # eight readers first: mlock alone faults the pages in one by one
+diff --git a/src/tensorfold/server/prompts.py b/src/tensorfold/server/prompts.py
+index 37fbe24..5bc5799 100644
+--- a/src/tensorfold/server/prompts.py
++++ b/src/tensorfold/server/prompts.py
+@@ -2,6 +2,7 @@
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
++import re
+ import threading
+ from typing import Any
+ 
+@@ -17,6 +18,75 @@ class RenderedPrompt:
+     vision: Any = None
+ 
+ 
++# Qwen's reserved strings: a request's TEXT that quotes one (a fetched page, a source file about the tokenizer or the chat template)
++# would be tokenized to the real token. A media marker miscounts the image markers (refused) or puts a media token with no media into the
++# prompt; <|im_start|>/<|im_end|> let pasted text open a turn of its own (injection) and a quote of one ends the reply; a </think> quoted
++# in the reasoning ends it there and the rest of the thinking leaks into the answer (the DeepSeek image v8 escape did this for the tags);
++# a quoted <tool_call> block copied into the reply is parsed as a real call. Each is written ``<`` + U+200B + the rest: plain text.
++_RESERVED = tuple("<|" + n + "|>" for n in ("image_pad", "video_pad", "vision_start", "vision_end", "vision_pad", "im_start", "im_end",
++                                            "endoftext")) + ("<think>", "</think>")
++_TOOL_TAGS = ("<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>")
++_ESCAPED = tuple("<\u200b" + r[1:] for r in _RESERVED)
++_ESCAPED_TOOLS = tuple("<\u200b" + r[1:] for r in _TOOL_TAGS)
++_RESERVED_RE = re.compile("|".join(re.escape(r) for r in _RESERVED + _TOOL_TAGS))
++_ESCAPED_RE = re.compile("|".join(re.escape(e) for e in _ESCAPED))
++_ESCAPED_ALL_RE = re.compile("|".join(re.escape(e) for e in _ESCAPED + _ESCAPED_TOOLS))
++
++
++def defuse_special_tokens(value):
++    """``value`` (messages, tools) with every literal reserved string in its strings written ``<`` + U+200B + the rest: plain text to the
++    tokenizer and to the reply parsers. Unchanged parts are returned as they are, so a large image payload is only scanned."""
++    if isinstance(value, str):
++        return _RESERVED_RE.sub(lambda m: "<\u200b" + m.group(0)[1:], value) if "<" in value else value
++    if isinstance(value, list):
++        out = [defuse_special_tokens(v) for v in value]
++        return out if any(a is not b for a, b in zip(out, value)) else value
++    if isinstance(value, dict):
++        out = {k: defuse_special_tokens(v) for k, v in value.items()}
++        return out if any(out[k] is not value[k] for k in value) else value
++    return value
++
++
++def restore_special_tokens(text: str, finished: bool, tools: bool = True) -> str:
++    """The model's text with the escaped strings of ``defuse_special_tokens`` written back as the strings it was shown (a quote of a file
++    stays exact). Three steps: after the reasoning/answer split (a restored ``</think>`` would split there) with ``tools=False`` on text the
++    tool-call parsers still read (a restored ``<tool_call>`` would be a call), then ``tools=True`` on what is shown or sent. Not finished: a
++    tail that may still grow into an escaped string is held back, so the result only ever extends."""
++    if "\u200b" not in text:
++        return text
++    escaped = _ESCAPED + _ESCAPED_TOOLS if tools else _ESCAPED
++    text = (_ESCAPED_ALL_RE if tools else _ESCAPED_RE).sub(lambda m: "<" + m.group(0)[2:], text)
++    if not finished:
++        for n in range(min(len(text), max(map(len, escaped)) - 1), 1, -1):
++            tail = text[-n:]
++            if tail.startswith("<\u200b") and any(e.startswith(tail) for e in escaped):
++                return text[:-n]
++    return text
++
++
++class RestoredCallDeltas:
++    """The argument fragments of streamed tool calls with the escaped strings written back; the fragments of a call are cumulative, so a
++    string split across two of them is held until the next one (every call ends in ``}``, which flushes it)."""
++
++    def __init__(self) -> None:
++        self.text: dict[int, str] = {}
++        self.sent: dict[int, int] = {}
++
++    def __call__(self, delta: dict):
++        call = (delta.get("tool_calls") or [None])[0]
++        fragment = ((call or {}).get("function") or {}).get("arguments")
++        if not fragment:
++            return delta
++        i = call["index"]
++        self.text[i] = self.text.get(i, "") + fragment
++        shown = restore_special_tokens(self.text[i], False)
++        done = self.sent.get(i, 0)           # a held-back tail can make ``shown`` shorter than what went out (a bare "<" does)
++        new, self.sent[i] = shown[done:], max(done, len(shown))
++        if not new:
++            return None
++        return {**delta, "tool_calls": [{**call, "function": {**call["function"], "arguments": new}}]}
++
++
+ def has_images(messages):
+     return any(isinstance(m, dict) and isinstance(m.get('content'), list)
+                and any(isinstance(p, dict) and p.get('type') in ('image_url', 'video_url') for p in m['content'])
+@@ -77,6 +147,7 @@ def prepare_prompt(app, messages, tools, thinking, prompt, fields):
+         else:
+             tokens = [int(t) for t in prompt]
+         return RenderedPrompt(tokens)
++    messages, tools = defuse_special_tokens(messages), defuse_special_tokens(tools)
+     if not has_images(messages):
+         tokens, history = app.render(messages, tools, thinking=thinking)
+         return RenderedPrompt(tokens, history)
+diff --git a/tests/test_cuda_server_tool_slips.py b/tests/test_cuda_server_tool_slips.py
+new file mode 100644
+index 0000000..155e7df
+--- /dev/null
++++ b/tests/test_cuda_server_tool_slips.py
+@@ -0,0 +1,79 @@
++"""Through the whole CUDA server: a reply that opens <tool_call> twice, or calls <function=function>, reaches the client as a tool call
++(streamed or not), not as raw text that ends the agent's turn."""
++import json
++
++import pytest
++
++pytest.importorskip("jinja2")
++
++from test_cuda_server_disconnect import PacedEngine, app_for, post, serving
++
++TOOLS = [{"type": "function", "function": {"name": "run_notebook_cell", "parameters": {"type": "object", "properties": {
++    "cellId": {"type": "string"}, "filePath": {"type": "string"}}}}}]
++CELL = "<function=run_notebook_cell>\n<parameter=cellId>\n#VSC-1\n</parameter>\n<parameter=filePath>\n/x/nb.ipynb\n</parameter>\n</function>"
++GOOD = "<tool_call>\n" + CELL + "\n</tool_call>"
++DOUBLED = "<tool_call>\n<tool_call>\n" + CELL + "\n</tool_call>"
++UNKNOWN = "<tool_call>\n<function=function>\n</function>\n</tool_call>"
++
++
++class OneShotEngine(PacedEngine):
++    """Emits ``text`` token by token, then the end token, and returns (the paced engine would go on with "x" to max_tokens)."""
++
++    def generate(self, prompt, max_tokens, sampling, on_tokens, draft=True):
++        for token in [ord(c) for c in self.text] + [0]:
++            if on_tokens([token]):
++                break
++        return {"rounds": len(self.text) + 1}
++
++
++BODY = {"messages": [{"role": "user", "content": "run it"}], "tools": TOOLS, "max_tokens": 400}
++
++
++def reply(tmp_path, text, stream):
++    engine = OneShotEngine(text)
++    with serving(app_for(tmp_path, engine)) as port:
++        status, raw = post(port, {**BODY, "stream": stream})
++    assert status == 200, raw
++    if not stream:
++        choice = json.loads(raw)["choices"][0]
++        return choice["finish_reason"], choice["message"].get("content") or "", [
++            (c["function"]["name"], c["function"]["arguments"]) for c in choice["message"].get("tool_calls") or []]
++    content, calls, finish = "", {}, None
++    for line in raw.splitlines():
++        if line.startswith("data: ") and line != "data: [DONE]":
++            choice = json.loads(line[6:])["choices"][0]
++            content += choice["delta"].get("content") or ""
++            for tc in choice["delta"].get("tool_calls") or []:
++                call = calls.setdefault(tc["index"], ["", ""])
++                call[0] += tc["function"].get("name") or ""
++                call[1] += tc["function"].get("arguments") or ""
++            finish = choice.get("finish_reason") or finish
++    return finish, content, [tuple(v) for _, v in sorted(calls.items())]
++
++
++@pytest.mark.parametrize("stream", [False, True])
++def test_a_single_call_is_unchanged(tmp_path, stream) -> None:
++    finish, content, calls = reply(tmp_path, GOOD, stream)
++    assert finish == "tool_calls" and content.strip() == "" and [c[0] for c in calls] == ["run_notebook_cell"]
++    assert json.loads(calls[0][1]) == {"cellId": "#VSC-1", "filePath": "/x/nb.ipynb"}
++
++
++@pytest.mark.parametrize("stream", [False, True])
++def test_a_doubled_opener_is_still_one_call(tmp_path, stream) -> None:
++    finish, content, calls = reply(tmp_path, DOUBLED, stream)
++    assert finish == "tool_calls" and "<tool_call>" not in content and "<function=" not in content
++    assert [c[0] for c in calls] == ["run_notebook_cell"]
++    assert json.loads(calls[0][1]) == {"cellId": "#VSC-1", "filePath": "/x/nb.ipynb"}
++
++
++@pytest.mark.parametrize("stream", [False, True])
++def test_a_call_to_an_undeclared_name_goes_to_the_client(tmp_path, stream) -> None:
++    finish, content, calls = reply(tmp_path, UNKNOWN, stream)
++    assert finish == "tool_calls" and "<function=" not in content
++    assert [(c[0], c[1]) for c in calls] == [("function", "{}")]
++
++
++@pytest.mark.parametrize("stream", [False, True])
++def test_prose_that_mentions_the_tag_is_still_content(tmp_path, stream) -> None:
++    finish, content, calls = reply(tmp_path, "Use the <tool_call> tag to call tools.", stream)
++    assert finish == "stop" and not calls and "<tool_call>" in content
+diff --git a/tests/test_media_marker_defuse.py b/tests/test_media_marker_defuse.py
+new file mode 100644
+index 0000000..cda6c00
+--- /dev/null
++++ b/tests/test_media_marker_defuse.py
+@@ -0,0 +1,81 @@
++"""A request's text that quotes a Qwen media marker must reach the model as plain text, not as the special token."""
++import json
++import os
++from pathlib import Path
++
++import pytest
++
++from tensorfold.server.prompts import RestoredCallDeltas, defuse_special_tokens, restore_special_tokens
++
++MARKERS = ("<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>", "<|vision_pad|>", "<|im_start|>", "<|im_end|>",
++           "<|endoftext|>", "<think>", "</think>", "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>")
++
++
++def test_markers_in_strings_parts_tool_calls_and_tools_are_broken():
++    m = "<|vision_start|><|image_pad|><|vision_end|>"
++    messages = [{"role": "user", "content": "see " + m},
++                {"role": "assistant", "content": None,
++                 "tool_calls": [{"id": "c", "type": "function", "function": {"name": "f", "arguments": '{"q": "<|video_pad|>"}'}}]},
++                {"role": "tool", "tool_call_id": "c", "content": [{"type": "text", "text": m}]}]
++    out = defuse_special_tokens(messages)
++    text = json.dumps(out, ensure_ascii=False)
++    assert not any(k in text for k in MARKERS)
++    assert out[0]["content"] == "see <​|vision_start|><​|image_pad|><​|vision_end|>"
++    assert messages[0]["content"].endswith(m), "the request is not modified in place"
++    assert defuse_special_tokens({"description": "<|vision_pad|>"})["description"] == "<​|vision_pad|>"
++
++
++def test_other_text_and_image_payloads_are_returned_unchanged():
++    messages = [{"role": "user", "content": [{"type": "text", "text": "<|x|> and <|fim_prefix|> and <function=f> and <parameter=p> and </function>"},
++                                             {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "QUJD" * 1000}}]}]
++    assert defuse_special_tokens(messages) is messages
++    assert defuse_special_tokens(None) is None and defuse_special_tokens(3) == 3
++
++
++def test_tool_tags_stay_escaped_until_the_call_parsers_have_read_the_text():
++    text = "ask: <tool_call>\n<function=f>\n</function>\n</tool_call> and <tool_response>x</tool_response> and </think>"
++    esc = defuse_special_tokens(text)
++    assert "<tool_call>" not in esc and "<tool_response>" not in esc and "</think>" not in esc
++    before_parse = restore_special_tokens(esc, True, tools=False)
++    assert "<tool_call>" not in before_parse and "</tool_response>" not in before_parse, "a parser would read a call here"
++    assert "</think>" in before_parse
++    assert restore_special_tokens(before_parse, True) == text
++
++
++def test_streamed_call_arguments_are_restored_without_gaps_or_repeats():
++    pieces = ['{"text":"a <', "\u200b/tool_", 'call> b <\u200b|im_', 'end|> c"', "}"]
++    restorer = RestoredCallDeltas()
++    got = []
++    for piece in pieces:
++        out = restorer({"tool_calls": [{"index": 0, "function": {"arguments": piece}}]})
++        if out is not None:
++            got.append(out["tool_calls"][0]["function"]["arguments"])
++    assert "".join(got) == '{"text":"a </tool_call> b <|im_end|> c"}'
++    head = restorer({"tool_calls": [{"index": 1, "id": "c", "type": "function", "function": {"name": "f", "arguments": ""}}]})
++    assert head["tool_calls"][0]["function"]["name"] == "f"
++
++
++def test_restore_is_exact_and_only_ever_extends():
++    raw = "see <\u200b|vision_start|><\u200b|image_pad|><\u200b|vision_end|> and <div> a\u200bb <\u200b|nope|> <\u200b/think> <\u200bthink> <\u200btool_call> end"
++    final = restore_special_tokens(raw, True)
++    assert final == "see <|vision_start|><|image_pad|><|vision_end|> and <div> a\u200bb <\u200b|nope|> </think> <think> <tool_call> end"
++    for n in range(len(raw) + 1):                  # a streamed prefix never needs taking back
++        assert final.startswith(restore_special_tokens(raw[:n], False)), n
++    text = "x <|vision_start|><|image_pad|> y <|video_pad|> <|im_end|>\n<|im_start|>assistant <think>t</think> a</think>"
++    assert restore_special_tokens(defuse_special_tokens(text), True) == text
++    assert restore_special_tokens("plain text <b>", False) == "plain text <b>"
++
++
++MODEL = os.environ.get("TENSORFOLD_EXL3_FLASHNEXT", "")
++
++
++@pytest.mark.skipif(not (MODEL and (Path(MODEL) / "tokenizer.json").is_file()), reason="needs a Qwen tokenizer.json")
++def test_the_defused_text_has_no_special_token_ids():
++    from tokenizers import Tokenizer
++
++    tok = Tokenizer.from_file(str(Path(MODEL) / "tokenizer.json"))
++    special = {tok.token_to_id(k) for k in MARKERS}
++    assert None not in special
++    raw = "x <|vision_start|><|image_pad|><|vision_end|> y <|video_pad|> <|im_end|>\n<|im_start|>system <|endoftext|> <think>a</think>"
++    assert special & set(tok.encode(raw).ids), "the literal marker is a special token without the fix"
++    assert not special & set(tok.encode(defuse_special_tokens(raw)).ids)
+diff --git a/tests/test_tool_call_glitches.py b/tests/test_tool_call_glitches.py
+new file mode 100644
+index 0000000..e1b8959
+--- /dev/null
++++ b/tests/test_tool_call_glitches.py
+@@ -0,0 +1,66 @@
++"""Two slips a model made in agent turns (10-09): ``<tool_call>`` opened twice in a row, and ``<function=function>`` (a name no tool declares).
++Both used to reach the client as raw text and end the turn."""
++import json
++
++from tensorfold.cuda.reply_text import collapse_call_openers, hide_tool_calls, parse_tool_calls
++from tensorfold.engine.tool_draft import ToolCallStreamer
++
++TOOLS = [{"type": "function", "function": {"name": "run_notebook_cell", "parameters": {"type": "object", "properties": {
++    "cellId": {"type": "string"}, "filePath": {"type": "string"}, "reason": {"type": "string"}}}}},
++    {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]
++CELL = ("<function=run_notebook_cell>\n<parameter=cellId>\n#VSC-8918ca1a\n</parameter>\n<parameter=filePath>\n/Users/x/nb.ipynb\n</parameter>\n"
++        "<parameter=reason>\n매개변수 회로 실행 확인\n</parameter>\n</function>")
++GOOD = "<tool_call>\n" + CELL + "\n</tool_call>"
++DOUBLED = "<tool_call>\n<tool_call>\n" + CELL + "\n</tool_call>"
++UNKNOWN = "<tool_call>\n<function=function>\n</function>\n</tool_call>"
++
++
++def names(calls):
++    return [c["function"]["name"] for c in calls or []]
++
++
++def test_a_doubled_opener_is_read_as_one_call() -> None:
++    assert parse_tool_calls(DOUBLED, TOOLS)[1] is None, "the parser alone still refuses it"
++    content, calls = parse_tool_calls(collapse_call_openers(DOUBLED), TOOLS)
++    assert content == "" and names(calls) == ["run_notebook_cell"]
++    assert json.loads(calls[0]["function"]["arguments"]) == {"cellId": "#VSC-8918ca1a", "filePath": "/Users/x/nb.ipynb",
++                                                             "reason": "매개변수 회로 실행 확인"}
++    assert hide_tool_calls(collapse_call_openers(DOUBLED), finished=True) == ""
++
++
++def test_other_text_is_not_touched_by_the_collapse() -> None:
++    two_calls = GOOD + "\n" + GOOD
++    assert collapse_call_openers(two_calls) == two_calls and collapse_call_openers(GOOD) == GOOD
++    assert collapse_call_openers("write <tool_call> then stop") == "write <tool_call> then stop"
++    assert collapse_call_openers("<TOOL_CALL>  <tool_call>x") == "<tool_call>\nx"
++
++
++def test_streamed_prefixes_of_a_doubled_opener_end_in_one_clean_call() -> None:
++    streamer, args = ToolCallStreamer(TOOLS), ""
++    for n in range(1, len(DOUBLED) + 1):           # the server feeds the collapsed text of every growing prefix
++        for delta in streamer.feed(collapse_call_openers(DOUBLED[:n])):
++            args += delta["tool_calls"][0]["function"].get("arguments") or ""
++    assert streamer.state == "outside" and streamer.streamed
++    assert json.loads(args)["cellId"] == "#VSC-8918ca1a"
++
++
++def test_an_undeclared_name_comes_back_as_a_call_only_when_asked() -> None:
++    content, calls = parse_tool_calls(UNKNOWN, TOOLS)
++    assert calls is None and "<function=function>" in content, "the default keeps the old behaviour"
++    content, calls = parse_tool_calls(UNKNOWN, TOOLS, keep_unknown=True)
++    assert content == "" and names(calls) == ["function"] and calls[0]["function"]["arguments"] == "{}"
++    assert parse_tool_calls(UNKNOWN, TOOLS, max_calls=1, keep_unknown=True)[1] is None, "single-call replies are unchanged"
++
++
++def test_declared_and_undeclared_calls_keep_their_order() -> None:
++    text = GOOD + "\n" + UNKNOWN
++    content, calls = parse_tool_calls(text, TOOLS, keep_unknown=True)
++    assert content == "" and names(calls) == ["run_notebook_cell", "function"]
++    content, calls = parse_tool_calls(UNKNOWN + "\n" + GOOD, TOOLS, keep_unknown=True)
++    assert names(calls) == ["function", "run_notebook_cell"]
++
++
++def test_text_that_is_not_a_call_stays_content_even_with_keep_unknown() -> None:
++    for text in ("<tool_call>not a call</tool_call>", "<tool_call>{}</tool_call>", "no tools here <function=x>"):
++        content, calls = parse_tool_calls(text, TOOLS, keep_unknown=True)
++        assert calls is None and content == text, text

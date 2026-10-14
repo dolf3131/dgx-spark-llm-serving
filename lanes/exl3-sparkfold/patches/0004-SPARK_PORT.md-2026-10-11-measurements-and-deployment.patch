@@ -1,0 +1,28 @@
+From dcbd80894efc15eda86fdd8408ad51fe28e9013c Mon Sep 17 00:00:00 2001
+From: dolf3131 <144650661+dolf3131@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 09:37:28 +0900
+Subject: [PATCH 4/7] SPARK_PORT.md: 2026-10-11 measurements and deployment
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ SPARK_PORT.md | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/SPARK_PORT.md b/SPARK_PORT.md
+index 23d10a5..20fa9dd 100644
+--- a/SPARK_PORT.md
++++ b/SPARK_PORT.md
+@@ -33,6 +33,13 @@ Added here: `prefixes.miss_note` (log line `prefix miss: ... diverges at token N
+ - Extensions compiled in this image (CUDA 13.3, sm_121): `tensorfold_exl3_experts_v8r` 112 s, `tensorfold_exl3_linear_v4` 58 s, `tensorfold_qwen4_exp_qsa_prompt_p7` 9 s, into `~/.cache/tensorfold-spark`.
+ - GPU tests share the live server's GPU, so the memory gate has almost no room: with `TENSORFOLD_MEMORY_RESERVE_GIB=2 TENSORFOLD_CUDA_MEMORY_LIMIT_GB=3` the same 7 tests + 2 errors (growth past first rows, shared-round graphs) fail on merged and on pure SparkFold alike; they need the server stopped.
+ 
++## Measured 2026-10-11 and DEPLOYED (see ~/data/runs/llm/stage14_spark_port/RESULTS.md)
++
++- Cold prefill, real text, 1.9k/7.8k/25k/49k tokens: TF-opt fresh 1,341/1,374/1,364/1,346 tok/s, TF-spark 1,830/2,067/2,054/2,061. 4-layer end-to-end 6,082 (stock) -> 11,995 (TF-opt) -> 16,238 / 17,504 (2048 / 4096-row pieces), bit-identical to stock.
++- Kernel at 1024/2048/4096 rows: mine 9.88/16.3/28.5 ms, SparkFold 7.97/11.9/18.9 ms.
++- The cold re-prefill thrash reproduces and is fixed by the memory floor: with the default floor 7 of 8 later turns of three alternating 86-122k conversations missed, with `TENSORFOLD_MEMORY_RESERVE_GIB=6` 0 of 9 (log lines name the gate numbers).
++- Deployed: `start-qwen38-flash-next-exl3-spark.sh` default PROFILE=spark + floor 6 + PIN_EXTRA -6.2.
++
+ ## Serving
+ 
+ `~/data/runs/llm/start-qwen38-flash-next-exl3-spark.sh` (PROFILE=safe|spark|bare). Rollback: `~/data/runs/llm/start-qwen38-flash-next-exl3-tf.sh` (TF-opt sources, `~/.cache/tensorfold-v065`).

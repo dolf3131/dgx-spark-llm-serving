@@ -1,0 +1,28 @@
+From 03c4b44b080d507c8ad1c6c12da60edda844a375 Mon Sep 17 00:00:00 2001
+From: dolf3131 <144650661+dolf3131@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 13:47:33 +0900
+Subject: [PATCH 7/7] SPARK_PORT.md: NVMe spill
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ SPARK_PORT.md | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/SPARK_PORT.md b/SPARK_PORT.md
+index 20fa9dd..c9a06cb 100644
+--- a/SPARK_PORT.md
++++ b/SPARK_PORT.md
+@@ -43,3 +43,13 @@ Added here: `prefixes.miss_note` (log line `prefix miss: ... diverges at token N
+ ## Serving
+ 
+ `~/data/runs/llm/start-qwen38-flash-next-exl3-spark.sh` (PROFILE=safe|spark|bare). Rollback: `~/data/runs/llm/start-qwen38-flash-next-exl3-tf.sh` (TF-opt sources, `~/.cache/tensorfold-v065`).
++
++## NVMe spill of idle conversations (kv-spill branch, tag deployed-20261011b, 2026-10-11)
++
++`families/qwen4_exp/cuda/spill.py` + hooks in `prefixes.py` (`spill_slot`, `_from_disk`, `evict_note`) and `multi._evict_kept`; off unless `TF_SPILL_DIR`.
++- WRITE: when the memory gate (`_evict_kept`), the fresh-request slot takeover (`_cheapest_idle`) or a fork claim drops an idle slot, its longest kept state (the rows below the position of every attention layer and the MTP head, the DeltaNet snapshot, the MTP tail) is written with O_DIRECT (`spill.SpillStore.save`), >= `TF_SPILL_MIN` tokens (16384), LRU under `TF_SPILL_GIB` (48 in the start script), a longer state of the same conversation supersedes the shorter file.
++- READ: `slot_for` finds no in-memory state, asks `store.find(prompt)` for the longest stored state the prompt extends, grows a free (or taken-over) slot through the memory gate, and `store.load` copies the same bytes `copy_prefix` would have copied and returns the `resume` dict `prefill_begin` takes; any failure falls back to a normal prefill and forgets the file.
++- RESTART: files are adopted at startup when the signature (model files, KV format, geometry, numerics knobs, tensorfold version) matches, deleted otherwise. Directory `~/.cache/tensorfold-spark/spill` is root-owned 0700, files 0600: they hold the conversations' token ids and attention rows. Clean it with `docker run --user 0:0 -v ~/.cache/tensorfold-spark:/c --entrypoint sh tensorfold-qwen38:v0.3.6.3 -c "rm -f /c/spill/*"` while the server is stopped.
++- Measured (real model, 100k-token conversations): write 1.5-1.8 GiB in 0.30-0.40 s (4.5-5.1 GiB/s), read 0.26-0.45 s (3.9-5.9 GiB/s); a conversation that costs 40-50 s to read cold is back in 0.8-1.9 s wall; replies equal the cold reads (greedy, 9 comparisons) also after `docker restart`. Pathological config (12.2 GiB floor, MemAvailable ~16 GiB): every repeat 1.0-2.3 s instead of 40-68 s. Production config (floor 6) with 9 GiB of ballast: the gate still evicts, spill rescues, 1.4-1.8 s.
++- Limits: only the NEWEST state per conversation is kept, so a request that goes back (regenerate/edit the last message, the identical request after a follow-up) misses on disk as it would in memory; one writer thread stalls the other streams ~0.4 s per eviction; the stalls scale with state size; two-rank (TP) and image states are not spilled.
++- Tests: tests/test_flashnext_spill_file.py (CPU, 10), tests/cuda/test_flashnext_spill.py (GPU, 6: bf16 and int8, tiny model, reply == fresh prefill, failure fallback, restart); all other GPU files unchanged with the server stopped.

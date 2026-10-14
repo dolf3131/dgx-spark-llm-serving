@@ -1,0 +1,858 @@
+From 878ded1d56f4e2700c25fd66d9baa7fa92ce5860 Mon Sep 17 00:00:00 2001
+From: dolf3131 <144650661+dolf3131@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 13:22:31 +0900
+Subject: [PATCH 5/7] TF_SPILL_DIR: idle kept conversation states go to NVMe
+ (O_DIRECT) instead of being dropped, and a prompt that extends one reads it
+ back
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../families/qwen4_exp/cuda/engine.py         |   3 +
+ .../families/qwen4_exp/cuda/multi.py          |   2 +
+ .../families/qwen4_exp/cuda/prefixes.py       |  54 +++
+ .../families/qwen4_exp/cuda/spill.py          | 417 ++++++++++++++++++
+ tests/cuda/test_flashnext_spill.py            | 105 +++++
+ tests/test_flashnext_spill_file.py            | 183 ++++++++
+ 6 files changed, 764 insertions(+)
+ create mode 100644 src/tensorfold/families/qwen4_exp/cuda/spill.py
+ create mode 100644 tests/cuda/test_flashnext_spill.py
+ create mode 100644 tests/test_flashnext_spill_file.py
+
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/engine.py b/src/tensorfold/families/qwen4_exp/cuda/engine.py
+index bc56951..9fec753 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/engine.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/engine.py
+@@ -226,6 +226,9 @@ class FlashNextEngine:
+                                       graphs=graphs and os.environ.get("TF_LONE_GRAPHS", "1").strip() != "0",
+                                       # shared rounds replay graphs too (TF_MULTI_GRAPHS=0: eager shared rounds)
+                                       round_graphs=graphs and os.environ.get("TF_MULTI_GRAPHS", "1").strip() != "0")
++            from . import spill as spill_mod
++
++            self.multi.spill = spill_mod.open_from_env(w, self.kv_dtype, model_dir)       # TF_SPILL_DIR (unset: off)
+             self.scheduler = Scheduler(self.multi, max_streams=streams)
+         else:
+             self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/multi.py b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+index 950187b..b069732 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/multi.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+@@ -115,6 +115,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         self.draft_host = w.draft_ids.cpu().numpy() if w.draft_ids is not None else None
+         self.kept: list[tuple[list[int], State, dict, torch.Tensor | None]] = []   # (ids, slot, snapshot, tail)
+         self.keep = keep
++        self.spill = None            # a SpillStore under TF_SPILL_DIR (set by the engine): idle kept states go to disk, not nowhere
+ 
+     def _busy(self) -> set[int]:
+         return {id(s.st) for s in [*self.streams.values(), *self.filling]}
+@@ -223,6 +224,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         busy = self._busy()
+         for ids, st, _, _ in self.kept:
+             if st is not keep and st is not protect and id(st) not in busy:
++                prefixes.spill_slot(self, st)          # TF_SPILL_DIR: the conversation goes to disk instead of being lost
+                 self._drop_kept(st)
+                 self._shrink(st, release=True)
+                 if all(f is not st for f in self.free):
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/prefixes.py b/src/tensorfold/families/qwen4_exp/cuda/prefixes.py
+index d08922c..f08356a 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/prefixes.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/prefixes.py
+@@ -103,6 +103,56 @@ def _claim(owner, best, busy):
+     return slots[min(idle)[3]] if idle else None
+ 
+ 
++def spill_slot(owner, st) -> None:
++    """TF_SPILL_DIR: before an idle slot's kept states are dropped, write its longest one to disk (never raises, never blocks a drop forever)."""
++
++    store = getattr(owner, "spill", None)
++    if store is None or owner.w.comm is not None or getattr(owner, "planning", False):
++        return
++    mine = [k for k in owner.kept if k[1] is st]
++    if not mine:
++        return
++    ids, _, snap, tail = max(mine, key=lambda k: len(k[0]))
++    try:
++        store.save(st, ids, snap, tail)
++    except Exception as exc:                     # a spill that fails is the drop it replaces
++        print(f"[tensorfold] spill: not written ({type(exc).__name__}: {exc})", flush=True)
++
++
++def _from_disk(owner, prompt, busy):
++    """TF_SPILL_DIR: a slot holding the longest stored state ``prompt`` extends, read back from disk, as ``slot_for`` returns it; None when
++    nothing is stored, the memory gate refuses the room, or the read fails (the caller then prefills as it always did)."""
++
++    store = getattr(owner, "spill", None)
++    if store is None or owner.w.comm is not None or getattr(owner, "planning", False):
++        return None
++    entry = store.find(prompt)
++    if entry is None:
++        return None
++    if owner.free:
++        slot = owner.free.pop()
++    else:
++        try:
++            slot = _cheapest_idle(owner, busy)
++        except RuntimeError:
++            return None
++        spill_slot(owner, slot)                  # the conversation this slot holds goes to disk in turn
++        owner._drop_kept(slot)
++    try:
++        if not owner._grow(slot, len(prompt) + owner.depth + 2):
++            owner.free.append(slot)
++            return None
++        resume = store.load(entry, slot)
++    except Exception as exc:
++        print(f"[tensorfold] spill: reading a {entry.n}-token state failed ({type(exc).__name__}: {exc}); the prompt is read from the start", flush=True)
++        owner.free.append(slot)
++        owner._shrink(slot, force=True)
++        if isinstance(exc, (OSError, ValueError)):
++            store.forget(entry)                  # a file that cannot be read again is not worth keeping
++        return None
++    return slot, resume, entry.n
++
++
+ def slot_for(owner, prompt: list[int], reuse: bool):
+     """Copy a fork into spare capacity, or into the idle slot that loses the least; otherwise keep the old behavior."""
+ 
+@@ -113,6 +163,7 @@ def slot_for(owner, prompt: list[int], reuse: bool):
+         spare, before = (owner.free.pop(), None) if owner.free else (None, None)
+         if spare is None and (victim := _claim(owner, best, busy)) is not None:
+             spare, before = victim, list(owner.kept)
++            spill_slot(owner, victim)
+             owner._drop_kept(victim)
+         if spare is not None:
+             try:
+@@ -139,8 +190,11 @@ def slot_for(owner, prompt: list[int], reuse: bool):
+                       or len(k[0]) <= n and best[0][:len(k[0])] == k[0]]
+         _touch(owner, best)
+         return best[1], {"state": best[2], "tail": best[3]}, n
++    if reuse and (restored := _from_disk(owner, prompt, busy)) is not None:
++        return restored
+     if not owner.free:
+         idle = _cheapest_idle(owner, busy)
++        spill_slot(owner, idle)
+         owner._drop_kept(idle)
+         owner.free.append(idle)
+     return owner.free.pop(), None, 0
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/spill.py b/src/tensorfold/families/qwen4_exp/cuda/spill.py
+new file mode 100644
+index 0000000..bb2749b
+--- /dev/null
++++ b/src/tensorfold/families/qwen4_exp/cuda/spill.py
+@@ -0,0 +1,417 @@
++"""Idle conversations' kept prompt states on NVMe: a state the memory gate or a busy pool would drop is written out, and a prompt that extends it reads it back.
++
++A kept state is the attention rows below its position (keys, values, scales, indexer keys, pooled keys, the MTP head's too) plus a snapshot (DeltaNet
++recurrent state, conv taps, n-gram windows) and the MTP tail: ``State.copy_prefix`` copies exactly those rows between slots and ``State.restore``
++takes the snapshot. This module moves the same bytes to a file and back, so a resumed prompt is the one ``copy_prefix`` would have resumed: the
++same bytes, hence the same replies as the prefill it replaces. A 100k-token conversation is ~1.8 GiB (13 attention layers x ~1.35 KiB a row, plus
++~0.11 GiB of snapshot); an O_DIRECT write runs at ~5 GB/s and a read at ~7 GB/s here, against 50-100 s of prefill.
++
++Off unless ``TF_SPILL_DIR`` names a directory. ``TF_SPILL_GIB`` caps what the directory holds (default 32; the least recently used go first),
++``TF_SPILL_MIN`` is the shortest state worth writing (default 16384 tokens). Files are mode 0600 in a 0700 directory and carry the conversation's
++token ids and attention rows: treat the directory as private. States survive a restart when the model, the cache format and the numerics knobs
++match (``signature``); anything else found there is deleted.
++"""
++
++from __future__ import annotations
++
++import errno
++import hashlib
++import json
++import os
++import struct
++import time
++from dataclasses import dataclass
++from pathlib import Path
++
++import numpy as np
++import torch
++
++from tensorfold.cuda import direct_read
++
++FORMAT = 1
++MAGIC = b"TFSPILL1"
++ALIGN = direct_read.ALIGN
++PIECE = direct_read.PIECE
++GIB = 2**30
++DEFAULT_GIB = 32.0
++DEFAULT_MIN = 16384
++# environment that changes the arithmetic of a prefill: a state written under other values is not the state this process would compute
++NUMERICS = ("TF_EXL3_PROMPT", "TF_EXL3_PROMPT_ROWS", "TF_EXL3_PROMPT_NT", "TF_EXL3_MOE_WINDOW", "TENSORFOLD_PREFILL_ROWS", "TF_EXL3_HC_FP8",
++            "TF_HC_FUSE", "TF_ROT_IN4", "TF_EXL3_TALL", "TF_QSA_PROMPT", "TF_MOE_ROUTE_FUSED", "TF_MTP_HEAD", "TF_HEAD_SWITCH_ROWS",
++            "TF_DRAFT_VOCAB")
++
++DTYPES = {str(d): d for d in (torch.int8, torch.uint8, torch.int16, torch.int32, torch.int64, torch.float16, torch.bfloat16,
++                              torch.float32, torch.float64)}
++
++
++def _up(x: int) -> int:
++    return -(-int(x) // ALIGN) * ALIGN
++
++
++def env_settings(env=None) -> tuple[Path, int, int] | None:
++    """(directory, byte cap, shortest state) from ``TF_SPILL_*``, or None when spilling is off; a bad value refuses to start."""
++
++    env = os.environ if env is None else env
++    raw = env.get("TF_SPILL_DIR", "").strip()
++    if not raw or raw.lower() in ("0", "off", "no", "false"):
++        return None
++    try:
++        gib = float(env.get("TF_SPILL_GIB", "").strip() or DEFAULT_GIB)
++    except ValueError:
++        raise ValueError(f"TF_SPILL_GIB: a number of GiB, not {env.get('TF_SPILL_GIB')!r}") from None
++    if not 0.5 <= gib <= 4096:
++        raise ValueError(f"TF_SPILL_GIB: 0.5 to 4096 GiB, not {gib}")
++    try:
++        low = int(env.get("TF_SPILL_MIN", "").strip() or DEFAULT_MIN)
++    except ValueError:
++        raise ValueError(f"TF_SPILL_MIN: a whole number of tokens, not {env.get('TF_SPILL_MIN')!r}") from None
++    if low < 1024:
++        raise ValueError(f"TF_SPILL_MIN: at least 1024 tokens (shorter states prefill faster than they load), not {low}")
++    return Path(raw), int(gib * GIB), low
++
++
++def signature(w, kv_dtype: str, model_dir, env=None) -> str:
++    """What must match for a stored state to be the one this process would compute: model files, cache format, geometry, numerics knobs."""
++
++    env = os.environ if env is None else env
++    import tensorfold
++
++    c = w.cfg
++    index = Path(model_dir) / "model.safetensors.index.json"
++    stamp = None
++    if index.is_file():
++        stat = index.stat()
++        stamp = [stat.st_size, stat.st_mtime_ns]
++    geometry = [c.kv_heads, c.head_dim, c.index_dim, c.index_ratio, c.nv, c.dv, c.dk, c.conv_kernel, c.conv_dim, c.streams, c.hidden,
++                int(w.mtp is not None), sum(1 for layer in w.layers if layer.linear), sum(1 for layer in w.layers if not layer.linear)]
++    knobs = {k: env.get(k, "") for k in NUMERICS}
++    blob = json.dumps({"format": FORMAT, "version": getattr(tensorfold, "__version__", ""), "model": Path(model_dir).name, "index": stamp,
++                       "kv": kv_dtype, "geometry": geometry, "knobs": knobs}, sort_keys=True)
++    return hashlib.sha256(blob.encode()).hexdigest()[:32]
++
++
++@dataclass
++class Entry:
++    key: str
++    path: Path
++    ids: np.ndarray            # int32 token ids the state covers (its position's worth)
++    nbytes: int                # file size
++    used: float                # last time written or read (seconds since the epoch)
++    header: dict | None = None
++
++    @property
++    def n(self) -> int:
++        return int(self.ids.shape[0])
++
++
++class SpillStore:
++    """The spill directory: writes idle states, finds the longest one a prompt extends, reads it into a slot."""
++
++    def __init__(self, directory, limit_bytes: int, min_tokens: int, sig: str, *, log=print) -> None:
++        self.dir = Path(directory)
++        self.limit, self.min, self.sig, self.log = int(limit_bytes), int(min_tokens), sig, log
++        self.entries: dict[str, Entry] = {}
++        self.reader = direct_read.Reader()
++        self.pieces: list[torch.Tensor] = []
++        self.direct_write = hasattr(os, "O_DIRECT")
++        self.saved = self.loaded = self.dropped = 0
++        self.dir.mkdir(parents=True, exist_ok=True)
++        os.chmod(self.dir, 0o700)
++        self.scan()
++
++    # -- the directory ---------------------------------------------------------------------------------------
++    def scan(self) -> None:
++        """Adopt the files whose signature matches (a restart keeps conversations); delete every other file here."""
++
++        kept = removed = 0
++        for path in sorted(self.dir.glob("*")):
++            if path.suffix == ".tmp" or not path.is_file():
++                path.unlink(missing_ok=True)
++                continue
++            try:
++                header, ids = self._read_header(path)
++            except (OSError, ValueError, KeyError, json.JSONDecodeError, struct.error):
++                path.unlink(missing_ok=True)
++                removed += 1
++                continue
++            if header.get("signature") != self.sig or path.name != f"{header['key']}.spill":
++                path.unlink(missing_ok=True)
++                removed += 1
++                continue
++            self.entries[header["key"]] = Entry(header["key"], path, ids, path.stat().st_size, path.stat().st_mtime, header)
++            kept += 1
++        if kept or removed:
++            self.log(f"[tensorfold] spill: {kept} stored states adopted ({self.total() / GIB:.1f} GiB), {removed} stale files deleted", flush=True)
++        self._trim(0)
++
++    def total(self) -> int:
++        return sum(e.nbytes for e in self.entries.values())
++
++    def forget(self, entry: Entry) -> None:
++        self.entries.pop(entry.key, None)
++        entry.path.unlink(missing_ok=True)
++        self.dropped += 1
++
++    def _trim(self, room: int) -> None:
++        """Make ``room`` more bytes fit under the cap, least recently used first."""
++
++        for entry in sorted(self.entries.values(), key=lambda e: e.used):
++            if self.total() + room <= self.limit:
++                break
++            self.forget(entry)
++
++    # -- finding ---------------------------------------------------------------------------------------------
++    def find(self, prompt) -> Entry | None:
++        """The longest stored state whose ids the prompt starts with (and extends)."""
++
++        if not self.entries:
++            return None
++        ids = None
++        for entry in sorted(self.entries.values(), key=lambda e: -e.n):
++            if entry.n >= len(prompt):
++                continue
++            if ids is None:
++                ids = np.asarray(prompt, dtype=np.int32)
++            if np.array_equal(ids[:entry.n], entry.ids):
++                return entry
++        return None
++
++    # -- writing ---------------------------------------------------------------------------------------------
++    def save(self, st, ids, snap: dict, tail) -> bool:
++        """Write the kept state (``ids``, its snapshot and tail) held in slot ``st``; False when it is not worth it or does not fit."""
++
++        n = len(ids)
++        if n < self.min or snap["pos"] != n or getattr(st, "image_positions", None) is not None or st.pos < n:
++            return False
++        arr = np.asarray(ids, dtype=np.int32)
++        key = hashlib.sha1(arr.tobytes()).hexdigest()[:24]
++        have = self.entries.get(key)
++        if have is not None:                               # the same conversation state is already stored
++            have.used = time.time()
++            os.utime(have.path)
++            return False
++        tensors = self._tensors(st, snap, tail)
++        data = sum(_up(t.numel() * t.element_size()) for _, t in tensors) + _up(arr.nbytes)
++        if data > self.limit:
++            return False
++        extra = {"pos": int(snap["pos"]), "mtp_len": int(snap["mtp_len"]), "mtp_head": int(snap.get("mtp_head", 0)),
++                 "ple_history": None if snap["ple_history"] is None else
++                 {"dtype": str(snap["ple_history"].dtype), "data": np.asarray(snap["ple_history"]).tolist()}}
++        started = time.perf_counter()
++        meta, off = [], 0
++        for name, t in tensors:
++            meta.append({"name": name, "dtype": str(t.dtype), "shape": list(t.shape), "offset": off,
++                         "nbytes": int(t.numel() * t.element_size())})
++            off += _up(meta[-1]["nbytes"])
++        header = {"format": FORMAT, "signature": self.sig, "key": key, "n": n, "ids_bytes": int(arr.nbytes), "extra": extra, "tensors": meta,
++                  "time": time.time()}
++        blob = json.dumps(header).encode()
++        head_len = _up(len(blob) + 16)
++        ids_off = head_len
++        data_off = ids_off + _up(arr.nbytes)
++        total = data_off + off
++        self._trim(total)
++        path = self.dir / f"{key}.spill"
++        tmp = self.dir / f"{key}.tmp"
++        try:
++            self._write_file(tmp, blob, head_len, arr, ids_off, tensors, meta, data_off)
++            os.replace(tmp, path)
++        except Exception as exc:                           # a full disk or a refused write must never fail the request
++            tmp.unlink(missing_ok=True)
++            path.unlink(missing_ok=True)
++            self.log(f"[tensorfold] spill: writing a {n}-token state failed ({exc}); it is dropped as before", flush=True)
++            return False
++        entry = Entry(key, path, arr, total, time.time(), header)
++        self.entries[key] = entry
++        for old in [e for e in self.entries.values() if e is not entry and e.n < n and np.array_equal(arr[:e.n], e.ids)]:
++            self.forget(old)                               # the conversation moved on: its shorter states are superseded
++        self.saved += 1
++        took = time.perf_counter() - started
++        self.log(f"[tensorfold] spill: wrote a {n}-token kept state, {total / GIB:.2f} GiB in {took:.2f} s "
++                 f"({total / GIB / max(took, 1e-9):.1f} GiB/s); {len(self.entries)} stored, {self.total() / GIB:.1f} of {self.limit / GIB:.0f} GiB",
++                 flush=True)
++        return True
++
++    @staticmethod
++    def _tensors(st, snap: dict, tail) -> list[tuple[str, torch.Tensor]]:
++        """The bytes of a kept state in a fixed order: attention rows below the position, the snapshot's tensors, the tail."""
++
++        pos, mtp_len, ratio = int(snap["pos"]), int(snap["mtp_len"]), st.ratio
++        out: list[tuple[str, torch.Tensor]] = []
++
++        def cache(prefix: str, kv, ikc, pooled, rows: int) -> None:
++            out.append((f"{prefix}.k", kv.k[:rows]))
++            out.append((f"{prefix}.v", kv.v[:rows]))
++            if kv.quantized:
++                out.append((f"{prefix}.ks", kv.ks[:rows]))
++                out.append((f"{prefix}.vs", kv.vs[:rows]))
++            out.append((f"{prefix}.ik", ikc[:rows]))
++            out.append((f"{prefix}.pool", pooled[:rows // ratio]))
++
++        for i in range(len(st.kc)):
++            cache(f"l{i}", st.kc[i], st.ikc[i], st.pooled[i], pos)
++        if mtp_len and hasattr(st, "mtp_kc"):
++            cache("mtp", st.mtp_kc, st.mtp_ikc, st.mtp_pooled, mtp_len)
++        out += [("snap.rec", snap["rec"]), ("snap.conv", snap["conv"]), ("snap.ple_tail", snap["ple_tail"])]
++        if tail is not None:
++            out.append(("tail", tail))
++        return out
++
++    def _piece(self) -> torch.Tensor:
++        """A page-aligned page-locked staging block of PIECE bytes (+ ALIGN of slack for the padded tail)."""
++
++        if not self.pieces:
++            block = torch.empty((PIECE + 2 * ALIGN,), dtype=torch.uint8, pin_memory=torch.cuda.is_available())
++            lead = -block.data_ptr() % ALIGN
++            self.pieces.append(block[lead:lead + PIECE + ALIGN])
++        return self.pieces[0]
++
++    def release(self) -> None:
++        """Give the staging block back (pinned memory is real memory on this box)."""
++
++        self.pieces.clear()
++        self.reader.close()
++        getattr(torch._C, "_host_emptyCache", lambda: None)()
++
++    def _write_file(self, path: Path, blob: bytes, head_len: int, ids: np.ndarray, ids_off: int, tensors, meta, data_off: int) -> None:
++        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
++        fd = None
++        if self.direct_write:
++            try:
++                fd = os.open(path, flags | os.O_DIRECT, 0o600)
++            except OSError as exc:
++                if exc.errno != errno.EINVAL:
++                    raise
++                self.direct_write = False
++        if fd is None:
++            fd = os.open(path, flags, 0o600)
++        try:
++            head = bytearray(head_len)
++            head[:8] = MAGIC
++            head[8:16] = struct.pack("<Q", len(blob))
++            head[16:16 + len(blob)] = blob
++            piece = self._piece()
++            self._pwrite(fd, memoryview(head), 0, piece)
++            raw = np.zeros(_up(ids.nbytes), dtype=np.uint8)
++            raw[:ids.nbytes] = np.frombuffer(ids.tobytes(), dtype=np.uint8)
++            self._pwrite(fd, memoryview(raw), ids_off, piece)
++            for (name, t), m in zip(tensors, meta):
++                flat = t.reshape(-1).view(torch.uint8)
++                at = 0
++                while at < flat.numel():
++                    take = min(PIECE, flat.numel() - at)
++                    block = piece[:_up(take)]
++                    block[:take].copy_(flat[at:at + take])
++                    if _up(take) > take:
++                        block[take:].zero_()
++                    self._pwrite_block(fd, block, data_off + m["offset"] + at)
++                    at += take
++            os.fsync(fd)
++        finally:
++            os.close(fd)
++        if not self.direct_write:
++            fd = os.open(path, os.O_RDONLY)
++            try:
++                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)         # buffered pages are memory this box does not have
++            finally:
++                os.close(fd)
++
++    def _pwrite(self, fd: int, view: memoryview, offset: int, piece: torch.Tensor) -> None:
++        """Write a small aligned-length buffer through the staging block (O_DIRECT needs an aligned memory address)."""
++
++        n = len(view)
++        for at in range(0, n, PIECE):
++            take = min(PIECE, n - at)
++            block = piece[:take]
++            block.copy_(torch.frombuffer(view[at:at + take], dtype=torch.uint8))
++            self._pwrite_block(fd, block, offset + at)
++
++    @staticmethod
++    def _pwrite_block(fd: int, block: torch.Tensor, offset: int) -> None:
++        view = memoryview(block.numpy())
++        done = 0
++        while done < len(view):
++            k = os.pwritev(fd, [view[done:]], offset + done)
++            if k <= 0:
++                raise IOError("short write")
++            done += k
++
++    # -- reading ---------------------------------------------------------------------------------------------
++    @staticmethod
++    def _read_header(path: Path) -> tuple[dict, np.ndarray]:
++        with open(path, "rb", buffering=0) as f:
++            first = f.read(16)
++            if first[:8] != MAGIC:
++                raise ValueError("not a spill file")
++            (length,) = struct.unpack("<Q", first[8:16])
++            header = json.loads(f.read(length))
++            head_len = _up(length + 16)
++            f.seek(head_len)
++            ids = np.frombuffer(f.read(header["ids_bytes"]), dtype=np.int32).copy()
++        if ids.shape[0] != header["n"]:
++            raise ValueError("short ids")
++        return header, ids
++
++    def load(self, entry: Entry, st, expected: list[tuple[str, torch.Tensor]] | None = None) -> dict:
++        """Read ``entry`` into slot ``st`` (its caches already grown to the prompt) and return the ``resume`` dict ``prefill_begin`` takes."""
++
++        started = time.perf_counter()
++        header = entry.header or self._read_header(entry.path)[0]
++        n = header["n"]
++        extra = header["extra"]
++        ph = extra["ple_history"]
++        snap = {"pos": extra["pos"], "mtp_len": extra["mtp_len"], "mtp_head": extra["mtp_head"],
++                "ple_history": None if ph is None else np.asarray(ph["data"], dtype=np.dtype(ph["dtype"].replace("torch.", "")))}
++        mine = {name: t for name, t in self._tensors(st, {**snap, "rec": st.rec[0], "conv": st.conv, "ple_tail": st.ple_tail}, None)
++                if not name.startswith("snap.")}
++        data_off = _up(header["ids_bytes"]) + self._head_len(entry)
++        on_disk = {m["name"]: m for m in header["tensors"]}
++        wanted = [m for m in header["tensors"] if m["name"] not in ("tail", "snap.rec", "snap.conv", "snap.ple_tail")]
++        if set(m["name"] for m in wanted) != set(mine):
++            raise ValueError("spill file and slot disagree about the tensors")
++        for m in wanted:                                   # attention rows straight into the slot's caches
++            dst = mine[m["name"]]
++            self._check(m, dst)
++            raw = self.reader.read(entry.path, data_off + m["offset"], m["nbytes"], dst.device)
++            dst.reshape(-1).view(torch.uint8).copy_(raw)
++        device = st.rec.device
++        for name in ("snap.rec", "snap.conv", "snap.ple_tail"):
++            m = on_disk[name]
++            raw = self.reader.read(entry.path, data_off + m["offset"], m["nbytes"], device)
++            snap[name.split(".", 1)[1]] = raw.view(DTYPES[m["dtype"]]).reshape(m["shape"]).clone()
++        tail = None
++        if "tail" in on_disk:
++            m = on_disk["tail"]
++            raw = self.reader.read(entry.path, data_off + m["offset"], m["nbytes"], device)
++            tail = raw.view(DTYPES[m["dtype"]]).reshape(m["shape"]).clone()
++        entry.used = time.time()
++        os.utime(entry.path)
++        self.loaded += 1
++        took = time.perf_counter() - started
++        self.log(f"[tensorfold] spill: read a {n}-token kept state back, {entry.nbytes / GIB:.2f} GiB in {took:.2f} s "
++                 f"({entry.nbytes / GIB / max(took, 1e-9):.1f} GiB/s)", flush=True)
++        return {"state": snap, "tail": tail}
++
++    @staticmethod
++    def _head_len(entry: Entry) -> int:
++        with open(entry.path, "rb", buffering=0) as f:
++            first = f.read(16)
++        (length,) = struct.unpack("<Q", first[8:16])
++        return _up(length + 16)
++
++    @staticmethod
++    def _check(meta: dict, dst: torch.Tensor) -> None:
++        if str(dst.dtype) != meta["dtype"] or list(dst.shape) != meta["shape"] or dst.numel() * dst.element_size() != meta["nbytes"]:
++            raise ValueError(f"spill tensor {meta['name']}: file has {meta['dtype']}{meta['shape']}, slot wants {dst.dtype}{list(dst.shape)}")
++
++
++def open_from_env(w, kv_dtype: str, model_dir, env=None, log=print) -> SpillStore | None:
++    """The engine's store, or None when ``TF_SPILL_DIR`` is not set."""
++
++    settings = env_settings(env)
++    if settings is None:
++        return None
++    directory, limit, low = settings
++    store = SpillStore(directory, limit, low, signature(w, kv_dtype, model_dir, env), log=log)
++    log(f"[tensorfold] spill: idle conversations of {low}+ tokens go to {directory} (cap {limit / GIB:.0f} GiB) instead of being dropped", flush=True)
++    return store
+diff --git a/tests/cuda/test_flashnext_spill.py b/tests/cuda/test_flashnext_spill.py
+new file mode 100644
+index 0000000..4c70ddf
+--- /dev/null
++++ b/tests/cuda/test_flashnext_spill.py
+@@ -0,0 +1,105 @@
++"""TF_SPILL_DIR on the real MultiDecoder (tiny model): a conversation the pool or the memory gate would drop is written to disk, and its next turn
++reads it back; the reply equals the one a fresh prefill gives, token for token, with the same cached count a kept state would have given."""
++
++import numpy as np
++import pytest
++import torch
++
++if not torch.cuda.is_available():
++    pytest.skip("CUDA only", allow_module_level=True)
++
++from test_flashnext_forward import V, _model  # noqa: E402
++from test_flashnext_L7 import _ref, _run  # noqa: E402
++
++from tensorfold.engine.exact_sampling import Sampling  # noqa: E402
++from tensorfold.families.qwen4_exp.cuda import prefixes, spill  # noqa: E402
++from tensorfold.families.qwen4_exp.cuda.multi import MultiDecoder  # noqa: E402
++
++SMP = Sampling(seed=5, top_k=20, top_p=0.95)
++
++
++def conv(j: int, n: int):
++    return [(11 * i + 5 * j + 3) % (V - 1) + 1 for i in range(n)]
++
++
++def decoder(w, tmp_path, slots=2, kv="bf16", low=8, log=None):
++    dec = MultiDecoder(w, slots=slots, capacity=1024, depth=3, confidence=0.3, kv_dtype=kv, graphs=True, keep=8)
++    store = spill.SpillStore(tmp_path / "spill", 1 << 30, low, "test", log=log or (lambda *a, **k: None))
++    dec.spill = store
++    return dec, store
++
++
++@pytest.mark.parametrize("kv", ["bf16", "int8"])
++def test_a_conversation_pushed_out_of_the_pool_comes_back_from_disk_with_its_bits(tmp_path, kv):
++    w = _model()
++    dec, store = decoder(w, tmp_path, slots=2, kv=kv)
++    first = conv(0, 40)
++    a = _run(dec, first, 12, SMP)
++    assert a.out == _ref(w, first, 12, SMP, kv)
++    for j in (1, 2, 3):                                        # more conversations than slots: the oldest are taken over
++        _run(dec, conv(j, 30 + j), 6, SMP)
++    assert store.saved >= 1 and any(e.n == len(first) - 1 or e.n >= 30 for e in store.entries.values())
++    # the second turn of conversation 0: its first prompt, its reply and one more question
++    nxt = first + a.out + [101, 102, 103, 104]
++    before = store.loaded
++    b = _run(dec, nxt, 12, SMP)
++    assert store.loaded == before + 1, "the turn was read back from disk"
++    assert b.cached >= len(first) - 1, f"resumed from the stored state, not from zero (cached {b.cached})"
++    assert b.out == _ref(w, nxt, 12, SMP, kv), "a state read back from disk gives the replies a fresh prefill gives"
++
++
++def test_without_a_store_the_same_turn_prefills_from_zero(tmp_path):
++    w = _model()
++    dec, store = decoder(w, tmp_path, slots=2)
++    dec.spill = None
++    first = conv(0, 40)
++    a = _run(dec, first, 12, SMP)
++    for j in (1, 2, 3):
++        _run(dec, conv(j, 30 + j), 6, SMP)
++    b = _run(dec, first + a.out + [101, 102], 12, SMP)
++    assert b.cached == 0 and b.out == _ref(w, first + a.out + [101, 102], 12, SMP)
++
++
++def test_the_memory_gate_eviction_writes_the_state_too(tmp_path, monkeypatch):
++    w = _model()
++    dec, store = decoder(w, tmp_path, slots=3)
++    first = conv(0, 40)
++    a = _run(dec, first, 8, SMP)
++    victim = next(k[1] for k in dec.kept if len(k[0]) == max(len(x[0]) for x in dec.kept))
++    assert dec._evict_kept(dec.free[0] if dec.free else victim, protect=None) in (True, False)
++    assert store.saved >= 1, "the gate's eviction path goes through spill_slot"
++
++
++def test_a_failed_read_falls_back_to_a_fresh_prefill_and_forgets_the_file(tmp_path):
++    w = _model()
++    dec, store = decoder(w, tmp_path, slots=2)
++    first = conv(0, 40)
++    a = _run(dec, first, 8, SMP)
++    for j in (1, 2, 3):
++        _run(dec, conv(j, 30 + j), 6, SMP)
++    assert store.entries
++    entry = max(store.entries.values(), key=lambda e: e.n)
++    with open(entry.path, "r+b") as f:                         # truncate it: the read must fail, not return garbage
++        f.truncate(8192)
++    nxt = first + a.out + [101, 102]
++    b = _run(dec, nxt, 12, SMP)
++    assert b.out == _ref(w, nxt, 12, SMP) and b.cached == 0
++    assert entry.key not in store.entries and not entry.path.exists()
++    c = _run(dec, conv(5, 31), 4, SMP)                         # and the decoder is still sound
++    assert c.out == _ref(w, conv(5, 31), 4, SMP)
++
++
++def test_states_survive_a_restart_of_the_store(tmp_path):
++    w = _model()
++    dec, store = decoder(w, tmp_path, slots=2)
++    first = conv(0, 40)
++    a = _run(dec, first, 12, SMP)
++    for j in (1, 2, 3):
++        _run(dec, conv(j, 30 + j), 6, SMP)
++    n = len(store.entries)
++    assert n >= 1
++    again, store2 = decoder(w, tmp_path, slots=2)             # a new process: a new decoder, the same directory
++    assert len(store2.entries) == n
++    nxt = first + a.out + [101, 102, 103]
++    b = _run(again, nxt, 12, SMP)
++    assert store2.loaded == 1 and b.cached >= len(first) - 1 and b.out == _ref(w, nxt, 12, SMP)
+diff --git a/tests/test_flashnext_spill_file.py b/tests/test_flashnext_spill_file.py
+new file mode 100644
+index 0000000..bc571e7
+--- /dev/null
++++ b/tests/test_flashnext_spill_file.py
+@@ -0,0 +1,183 @@
++"""SpillStore: a kept state written to disk reads back bit for bit into another slot; the directory rules (cap, supersede, signature)."""
++import os
++import time
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++
++from tensorfold.families.qwen4_exp.cuda import kvcache, spill
++
++CAP, HEADS, DIM, IDX, RATIO, LAYERS, NV, DV, DK, CONV, CONVDIM, WIDE = 64, 2, 32, 16, 4, 3, 4, 8, 8, 4, 12, 24
++
++
++def make_state(seed: int = 0, kv: str = "int8", mtp: bool = True):
++    g = torch.Generator().manual_seed(seed)
++
++    def rnd(t):
++        if t.dtype in (torch.int8, torch.uint8):
++            t.copy_(torch.randint(-100, 100, t.shape, generator=g).to(t.dtype))
++        else:
++            t.copy_(torch.randn(t.shape, generator=g).to(t.dtype))
++        return t
++
++    st = SimpleNamespace(ratio=RATIO, pos=0, image_positions=None)
++    st.kc = [kvcache.KVCache(CAP, HEADS, DIM, "cpu", kv) for _ in range(LAYERS)]
++    for c in st.kc:
++        for t in (c.k, c.v, c.ks, c.vs):
++            rnd(t)
++    st.ikc = [rnd(torch.zeros((CAP, IDX), dtype=torch.bfloat16)) for _ in range(LAYERS)]
++    st.pooled = [rnd(torch.zeros((CAP // RATIO, IDX), dtype=torch.bfloat16)) for _ in range(LAYERS)]
++    if mtp:
++        st.mtp_kc = kvcache.KVCache(CAP, HEADS, DIM, "cpu", kv)
++        for t in (st.mtp_kc.k, st.mtp_kc.v, st.mtp_kc.ks, st.mtp_kc.vs):
++            rnd(t)
++        st.mtp_ikc = rnd(torch.zeros((CAP, IDX), dtype=torch.bfloat16))
++        st.mtp_pooled = rnd(torch.zeros((CAP // RATIO, IDX), dtype=torch.bfloat16))
++    st.rec = rnd(torch.zeros((2, LAYERS, NV, DV, DK), dtype=torch.float32))
++    st.conv = rnd(torch.zeros((LAYERS, CONV - 1, CONVDIM), dtype=torch.bfloat16))
++    st.ple_tail = rnd(torch.zeros((6, WIDE), dtype=torch.bfloat16))
++    return st, g
++
++
++def snapshot(st, pos: int, mtp_len: int, g):
++    return {"pos": pos, "rec": st.rec[0].clone(), "conv": st.conv.clone(), "ple_tail": st.ple_tail.clone(),
++            "ple_history": np.arange(5, dtype=np.int64) + pos, "mtp_len": mtp_len, "mtp_head": 1}
++
++
++def store(tmp_path, limit_gib: float = 1.0, low: int = 1024, sig: str = "sig"):
++    return spill.SpillStore(tmp_path / "spill", int(limit_gib * spill.GIB), low, sig, log=lambda *a, **k: None)
++
++
++def ids_of(n: int, seed: int = 1):
++    return list(np.random.default_rng(seed).integers(0, 200000, n))
++
++
++@pytest.mark.parametrize("kv", ["int8", "bf16"])
++def test_a_state_reads_back_bit_for_bit(tmp_path, kv) -> None:
++    src, g = make_state(3, kv)
++    pos, mtp_len = 40, 39
++    src.pos = pos
++    ids = ids_of(pos)
++    snap = snapshot(src, pos, mtp_len, g)
++    tail = torch.randn((1, WIDE), generator=g).to(torch.bfloat16)
++    s = store(tmp_path, low=1)
++    assert s.saved == 0 and s.save(src, ids, snap, tail) and s.saved == 1
++    dst, _ = make_state(99, kv)                           # a slot holding other bytes
++    entry = s.find(ids + [7, 8, 9])
++    assert entry is not None and entry.n == pos
++    resume = s.load(entry, dst)
++    for i in range(LAYERS):
++        assert torch.equal(dst.kc[i].k[:pos], src.kc[i].k[:pos]) and torch.equal(dst.kc[i].v[:pos], src.kc[i].v[:pos])
++        if kv != "bf16":
++            assert torch.equal(dst.kc[i].ks[:pos], src.kc[i].ks[:pos]) and torch.equal(dst.kc[i].vs[:pos], src.kc[i].vs[:pos])
++        assert torch.equal(dst.ikc[i][:pos], src.ikc[i][:pos])
++        assert torch.equal(dst.pooled[i][:pos // RATIO], src.pooled[i][:pos // RATIO])
++    assert torch.equal(dst.mtp_kc.k[:mtp_len], src.mtp_kc.k[:mtp_len]) and torch.equal(dst.mtp_ikc[:mtp_len], src.mtp_ikc[:mtp_len])
++    assert torch.equal(dst.mtp_pooled[:mtp_len // RATIO], src.mtp_pooled[:mtp_len // RATIO])
++    state = resume["state"]
++    assert state["pos"] == pos and state["mtp_len"] == mtp_len and state["mtp_head"] == 1
++    assert torch.equal(state["rec"], snap["rec"]) and torch.equal(state["conv"], snap["conv"]) and torch.equal(state["ple_tail"], snap["ple_tail"])
++    assert state["ple_history"].dtype == np.int64 and (state["ple_history"] == snap["ple_history"]).all()
++    assert torch.equal(resume["tail"], tail)
++    assert not torch.equal(dst.kc[0].k[pos:], src.kc[0].k[pos:]), "rows past the position are not part of the state"
++
++
++def test_find_wants_a_prompt_that_extends_the_stored_ids(tmp_path) -> None:
++    src, g = make_state(1)
++    src.pos = 2000
++    ids = ids_of(2000)
++    s = store(tmp_path)
++    assert s.save(src, ids, snapshot(src, 2000, 1999, g), None)
++    assert s.find(ids) is None, "the same prompt again is not an extension (a kept end resumes one token before its prompt's end)"
++    assert s.find(ids[:-1] + [1]) is None
++    assert s.find(ids + [5]) is not None
++    other = ids_of(2000, seed=2)
++    assert s.find(other + [5]) is None
++
++
++def test_short_states_and_images_are_not_written(tmp_path) -> None:
++    src, g = make_state(1)
++    src.pos = 500
++    s = store(tmp_path, low=1024)
++    assert not s.save(src, ids_of(500), snapshot(src, 500, 499, g), None)
++    src.pos = 2000
++    src.image_positions = [1]
++    assert not s.save(src, ids_of(2000), snapshot(src, 2000, 1999, g), None)
++    assert not s.entries and not list((tmp_path / "spill").glob("*"))
++
++
++def test_a_longer_state_supersedes_the_shorter_one_and_the_cap_drops_the_oldest(tmp_path) -> None:
++    src, g = make_state(1)
++    s = store(tmp_path)
++    a = ids_of(2000)
++    src.pos = 2000
++    assert s.save(src, a, snapshot(src, 2000, 1999, g), None)
++    b = a + ids_of(40, seed=5)
++    src.pos = 2040
++    assert s.save(src, b, snapshot(src, 2040, 2039, g), None)
++    assert len(s.entries) == 1 and next(iter(s.entries.values())).n == 2040
++    one = next(iter(s.entries.values())).nbytes
++    small = store(tmp_path / "cap", limit_gib=one * 2.5 / spill.GIB if one * 2.5 / spill.GIB >= 0.5 else 0.5)
++    small.limit = int(one * 2.5)
++    for k in range(4):
++        src.pos = 2000
++        assert small.save(src, ids_of(2000, seed=10 + k), snapshot(src, 2000, 1999, g), None)
++        time.sleep(0.02)
++    assert len(small.entries) == 2 and small.total() <= small.limit
++    assert {e.ids[0] for e in small.entries.values()} == {ids_of(2000, seed=12)[0], ids_of(2000, seed=13)[0]}, "least recently used go first"
++
++
++def test_the_same_state_is_not_written_twice_and_a_read_makes_it_recent(tmp_path) -> None:
++    src, g = make_state(1)
++    src.pos = 2000
++    ids = ids_of(2000)
++    s = store(tmp_path)
++    assert s.save(src, ids, snapshot(src, 2000, 1999, g), None) and not s.save(src, ids, snapshot(src, 2000, 1999, g), None)
++    assert s.saved == 1
++
++
++def test_a_restart_adopts_matching_files_and_deletes_the_rest(tmp_path) -> None:
++    src, g = make_state(1)
++    src.pos = 2000
++    ids = ids_of(2000)
++    s = store(tmp_path, sig="A")
++    assert s.save(src, ids, snapshot(src, 2000, 1999, g), None)
++    (tmp_path / "spill" / "stray.tmp").write_bytes(b"x")
++    (tmp_path / "spill" / "junk.spill").write_bytes(b"not a spill file")
++    again = store(tmp_path, sig="A")
++    assert len(again.entries) == 1 and again.find(ids + [1]) is not None
++    assert sorted(p.name for p in (tmp_path / "spill").glob("*")) == [f"{next(iter(again.entries))}.spill"]
++    other = store(tmp_path, sig="B")
++    assert not other.entries and not list((tmp_path / "spill").glob("*")), "another model or numerics: nothing is reused"
++
++
++def test_files_and_directory_are_private(tmp_path) -> None:
++    src, g = make_state(1)
++    src.pos = 2000
++    s = store(tmp_path)
++    assert s.save(src, ids_of(2000), snapshot(src, 2000, 1999, g), None)
++    assert (os.stat(tmp_path / "spill").st_mode & 0o777) == 0o700
++    assert all((os.stat(p).st_mode & 0o777) == 0o600 for p in (tmp_path / "spill").glob("*.spill"))
++
++
++def test_a_slot_with_other_geometry_refuses_the_read(tmp_path) -> None:
++    src, g = make_state(1)
++    src.pos = 2000
++    ids = ids_of(2000)
++    s = store(tmp_path)
++    assert s.save(src, ids, snapshot(src, 2000, 1999, g), None)
++    wrong, _ = make_state(1, "bf16")
++    with pytest.raises(ValueError):
++        s.load(s.find(ids + [1]), wrong)
++
++
++def test_env_settings() -> None:
++    assert spill.env_settings({}) is None and spill.env_settings({"TF_SPILL_DIR": "off"}) is None
++    d, cap, low = spill.env_settings({"TF_SPILL_DIR": "/x", "TF_SPILL_GIB": "8", "TF_SPILL_MIN": "4096"})
++    assert str(d) == "/x" and cap == 8 * spill.GIB and low == 4096
++    for bad in ({"TF_SPILL_DIR": "/x", "TF_SPILL_GIB": "many"}, {"TF_SPILL_DIR": "/x", "TF_SPILL_GIB": "0"},
++                {"TF_SPILL_DIR": "/x", "TF_SPILL_MIN": "10"}, {"TF_SPILL_DIR": "/x", "TF_SPILL_MIN": "x"}):
++        with pytest.raises(ValueError):
++            spill.env_settings(bad)

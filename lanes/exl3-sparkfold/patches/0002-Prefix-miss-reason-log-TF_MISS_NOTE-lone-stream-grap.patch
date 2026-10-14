@@ -1,0 +1,182 @@
+From 29bc26e37b3e6deeef1ec1f08c4dd8861d727ab7 Mon Sep 17 00:00:00 2001
+From: dolf3131 <144650661+dolf3131@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 02:01:54 +0900
+Subject: [PATCH 2/7] Prefix-miss reason log (TF_MISS_NOTE), lone-stream graph
+ state in the startup log, tests follow call_name
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../families/qwen4_exp/cuda/multi.py          | 13 +++--
+ .../families/qwen4_exp/cuda/prefixes.py       | 37 ++++++++++++++
+ tests/test_flashnext_miss_note.py             | 49 +++++++++++++++++++
+ tests/test_tool_call_glitches.py              | 15 +++---
+ 4 files changed, 103 insertions(+), 11 deletions(-)
+ create mode 100644 tests/test_flashnext_miss_note.py
+
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/multi.py b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+index c932c5f..df8ab4e 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/multi.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+@@ -313,9 +313,13 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+                 st.set_mtp_len(pos)
+                 captured += self.solo.graphs.warm(self.depth + 1)
+             st.reset(self.w)                         # the captures wrote its state
+-            if want:
+-                print(f"[tensorfold] lone-stream graph slot: {st.capacity} rows, {captured} graphs captured over "
+-                      f"{len(starts)} context buckets", flush=True)
++            print(f"[tensorfold] lone-stream graph slot: {st.capacity} rows, {captured} graphs captured over "
++                  f"{len(starts)} context bucket{'s' if len(starts) != 1 else ''}"
++                  f"{'' if want else ' (the others capture when a reply first reaches them; TF_SOLO_ROWS captures them now)'}",
++                  flush=True)
++        else:
++            print("[tensorfold] lone-stream CUDA graphs are off (no MTP head, experts that cannot be captured, or --no-drafts): "
++                  "a single reply decodes eagerly", flush=True)
+ 
+     @torch.no_grad()
+     def admit(self, s: Stream, told=None) -> None:
+@@ -333,7 +337,10 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         if self.w.comm is not None:
+             st, resume, s.cached = self._prepare_admission(s, told)
+         else:
++            note = prefixes.miss_note(self, s.prompt) if s.draft and s.vision is None else None
+             st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and s.vision is None)
++            if note is not None and s.cached == 0:
++                print(f"[tensorfold] {note}", flush=True)
+         if self.w.comm is None:
+             try:
+                 if not self._grow(st, len(s.prompt) + self.depth + 2,
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/prefixes.py b/src/tensorfold/families/qwen4_exp/cuda/prefixes.py
+index aaa4b1b..d08922c 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/prefixes.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/prefixes.py
+@@ -223,3 +223,40 @@ def remember(owner, ids, st, snap, tail, start: bool = False, checkpoint: bool =
+         if old is not st and id(old) not in busy and all(k[1] is not old for k in owner.kept) and \
+                 all(f is not old for f in owner.free):
+             owner.free.append(old)
++
++
++MISS_NOTE_ROWS = 8192      # prompts this long that resume from nothing get a log line saying why (TF_MISS_NOTE=0 off)
++
++
++def miss_note(owner, prompt) -> str | None:
++    """Read-only: why a long prompt would resume from no kept state, or None when one matches (or the note is off).
++
++    "diverges at token N" means the client changed the prompt N tokens in (nothing a server can keep); "no kept
++    state" means eviction already took them. Costs one array compare per kept entry, on misses of long prompts only."""
++
++    import os
++
++    if os.environ.get("TF_MISS_NOTE", "1") == "0" or len(prompt) < MISS_NOTE_ROWS:
++        return None
++    if _best(owner.kept, prompt) is not None:
++        return None
++    if not owner.kept:
++        return f"prefix miss: {len(prompt)} tokens, no kept state (every one was evicted or none was made)"
++    import numpy as np
++
++    ids = np.asarray(prompt, dtype=np.int64)
++    busy = owner._busy()
++    slots = {id(k[1]) for k in owner.kept}
++    best = None
++    for kept_ids, st, _, _ in owner.kept:
++        m = min(len(kept_ids), len(ids))
++        other = np.asarray(kept_ids[:m], dtype=np.int64)
++        diff = np.flatnonzero(ids[:m] != other)
++        agree = int(diff[0]) if len(diff) else m
++        if best is None or agree > best[0]:
++            best = (agree, len(kept_ids), id(st) in busy)
++    agree, length, working = best
++    why = (f"diverges at token {agree} of the {length}-token kept state" if agree < length
++           else f"the {length}-token kept state is not shorter than the prompt")
++    return (f"prefix miss: {len(prompt)} tokens, {len(owner.kept)} kept entries in {len(slots)} slots; the closest "
++            f"{why}{' (its slot is busy)' if working else ''}")
+diff --git a/tests/test_flashnext_miss_note.py b/tests/test_flashnext_miss_note.py
+new file mode 100644
+index 0000000..646d761
+--- /dev/null
++++ b/tests/test_flashnext_miss_note.py
+@@ -0,0 +1,49 @@
++"""miss_note: a long prompt that resumes from nothing says whether the client changed it or the kept states are gone."""
++from tensorfold.families.qwen4_exp.cuda import prefixes
++
++
++class Owner:
++    def __init__(self, kept, busy=()):
++        self.kept, self._busy_ids = kept, set(busy)
++
++    def _busy(self):
++        return self._busy_ids
++
++
++def entry(ids, slot):
++    return (ids, slot, {"mtp_len": 0}, None)
++
++
++def test_no_note_when_a_kept_state_matches() -> None:
++    slot = object()
++    prompt = list(range(10000))
++    assert prefixes.miss_note(Owner([entry(prompt[:9000], slot)]), prompt) is None
++
++
++def test_no_note_for_short_prompts_or_when_switched_off(monkeypatch) -> None:
++    owner = Owner([])
++    assert prefixes.miss_note(owner, list(range(100))) is None
++    monkeypatch.setenv("TF_MISS_NOTE", "0")
++    assert prefixes.miss_note(owner, list(range(10000))) is None
++
++
++def test_empty_kept_list_says_so() -> None:
++    assert "no kept state" in prefixes.miss_note(Owner([]), list(range(10000)))
++
++
++def test_divergence_point_is_reported() -> None:
++    slot = object()
++    kept = list(range(9000))
++    prompt = list(range(10000))
++    prompt[1234] = -1                      # the client changed one token near the start
++    note = prefixes.miss_note(Owner([entry(kept, slot)]), prompt)
++    assert "diverges at token 1234 of the 9000-token kept state" in note and "1 kept entries in 1 slots" in note
++
++
++def test_closest_entry_wins_and_busy_slot_is_marked() -> None:
++    a, b = object(), object()
++    prompt = list(range(10000))
++    far = list(range(9000)); far[10] = -1
++    near = list(range(9000)); near[8000] = -1
++    note = prefixes.miss_note(Owner([entry(far, a), entry(near, b)], busy=[id(b)]), prompt)
++    assert "token 8000" in note and "(its slot is busy)" in note and "2 kept entries in 2 slots" in note
+diff --git a/tests/test_tool_call_glitches.py b/tests/test_tool_call_glitches.py
+index e1b8959..aa89eb0 100644
+--- a/tests/test_tool_call_glitches.py
++++ b/tests/test_tool_call_glitches.py
+@@ -44,23 +44,22 @@ def test_streamed_prefixes_of_a_doubled_opener_end_in_one_clean_call() -> None:
+     assert json.loads(args)["cellId"] == "#VSC-8918ca1a"
+ 
+ 
+-def test_an_undeclared_name_comes_back_as_a_call_only_when_asked() -> None:
++def test_an_undeclared_name_comes_back_as_a_call_in_either_mode() -> None:
+     content, calls = parse_tool_calls(UNKNOWN, TOOLS)
+-    assert calls is None and "<function=function>" in content, "the default keeps the old behaviour"
+-    content, calls = parse_tool_calls(UNKNOWN, TOOLS, keep_unknown=True)
+     assert content == "" and names(calls) == ["function"] and calls[0]["function"]["arguments"] == "{}"
+-    assert parse_tool_calls(UNKNOWN, TOOLS, max_calls=1, keep_unknown=True)[1] is None, "single-call replies are unchanged"
++    content, calls = parse_tool_calls(UNKNOWN, TOOLS, max_calls=1)       # SparkFold's call_name: single-call replies too (#256)
++    assert content == "" and names(calls) == ["function"]
+ 
+ 
+ def test_declared_and_undeclared_calls_keep_their_order() -> None:
+     text = GOOD + "\n" + UNKNOWN
+-    content, calls = parse_tool_calls(text, TOOLS, keep_unknown=True)
++    content, calls = parse_tool_calls(text, TOOLS)
+     assert content == "" and names(calls) == ["run_notebook_cell", "function"]
+-    content, calls = parse_tool_calls(UNKNOWN + "\n" + GOOD, TOOLS, keep_unknown=True)
++    content, calls = parse_tool_calls(UNKNOWN + "\n" + GOOD, TOOLS)
+     assert names(calls) == ["function", "run_notebook_cell"]
+ 
+ 
+-def test_text_that_is_not_a_call_stays_content_even_with_keep_unknown() -> None:
++def test_text_that_is_not_a_call_stays_content() -> None:
+     for text in ("<tool_call>not a call</tool_call>", "<tool_call>{}</tool_call>", "no tools here <function=x>"):
+-        content, calls = parse_tool_calls(text, TOOLS, keep_unknown=True)
++        content, calls = parse_tool_calls(text, TOOLS)
+         assert calls is None and content == text, text

@@ -1,0 +1,143 @@
+From 64e05bdd3aa5befb99bd20286fe2edd6c5385912 Mon Sep 17 00:00:00 2001
+From: dolf3131 <144650661+dolf3131@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 02:53:52 +0900
+Subject: [PATCH 3/7] Memory-gate eviction log with the gate's numbers
+ (+tests), SPARK_PORT.md
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ SPARK_PORT.md                                 | 38 +++++++++++++++++++
+ .../families/qwen4_exp/cuda/multi.py          | 18 ++++++++-
+ tests/test_flashnext_evict_note.py            | 30 +++++++++++++++
+ 3 files changed, 84 insertions(+), 2 deletions(-)
+ create mode 100644 SPARK_PORT.md
+ create mode 100644 tests/test_flashnext_evict_note.py
+
+diff --git a/SPARK_PORT.md b/SPARK_PORT.md
+new file mode 100644
+index 0000000..23d10a5
+--- /dev/null
++++ b/SPARK_PORT.md
+@@ -0,0 +1,38 @@
++# TF-spark: the deployed TF-opt tree + SparkFold `spark-exl3`
++
++Branch `spark-port` of `~/data/runs/tfdev/TF-spark`. Commits, oldest first:
++
++1. `044f872` TF-opt as deployed 2026-10-10 (the baseline; 0.6.5 + my EXL3 prompt kernel, special-token escape, tool-call slip fixes, `TENSORFOLD_PIN_EXTRA_GIB`).
++2. `ef1ffcd` merge of `grearjake-star/TensorFold@806b345` (SparkFold, 89 commits on the same 0.6.5 base `609ca41`).
++3. `29bc26e` + later: the prefix-miss reason log, the lone-stream graph state in the startup log, tests following `call_name`.
++
++## How the merge was resolved (10 conflicting files)
++
++| Files | Taken | Why |
++|---|---|---|
++| `cuda/exl3/experts.{cpp,cu,py}`, `experts_cb{0,1,2}.cu`, `forward.py`, `exl3_pack.py`, `exl3.py` | SparkFold | Its `experts_prompt.cuh` does what my `grouped_mb` did (decode a weight tile once, reuse it for the item's 64 pairs) and claims the same bits as the grouping kernel; it also brings plan items, the side stream, wider windows. My kernel is kept OUTSIDE the tree (`../mb-kernel-opt/`) for a bit-oracle comparison. |
++| `cuda/reply_text.py` | SparkFold's `call_name` | It sends a call to an undeclared tool under its own name in single- and multi-call modes (my `keep_unknown` did it for multi-call only). My `collapse_call_openers` stays. |
++| `cuda/server.py` | both | `PreparedRequest` carries `defused` (mine) and `effort`/`request_id` (theirs); the final-answer path keeps my restore/collapse/undeclared-tool warning and uses their `policy.parsed_content`. |
++
++Not touched by the conflicts and still in place: `server/prompts.py` (special-token escape), `TENSORFOLD_PIN_EXTRA_GIB` in `engine.py`, my three test files (one assertion changed with `call_name`).
++
++## What the merge brings (all env knobs; defaults are the tree's, see the start script profiles)
++
++- Prefix/kept-state policy: `TF_KEEP`, slot choice (`_claim`, `_cheapest_idle`, `TF_FRESH_SLACK`), system-block checkpoint (`TF_SYS_CHECKPOINT`), warm starts (`TF_WARM_STARTS`).
++- CUDA graphs: per-slot lone-stream graphs, `TF_SOLO_ROWS` (pre-size the graph slot and capture every context bucket at start; issue #336), no `gc.collect` per capture, shared-round graphs (`TF_MULTI_GRAPHS`, default on).
++- Prefill: `TF_EXL3_PROMPT=prompt` kernel, `TENSORFOLD_PREFILL_ROWS`/`TF_EXL3_MOE_WINDOW` up to 4096, fused fp16 prompt matmuls, tall tiles (`TF_EXL3_TALL`), HC read-out fusion, QSA prompt indexer, shared expert on a side stream (`TF_EXL3_PROMPT_SIDE`).
++- Decode: n-gram stage batching and read-ahead (`TF_STAGE_BATCH`, `TF_DECODE_AHEAD`, `TF_NGRAM_AHEAD`), fused MoE routing (`TF_MOE_ROUTE_FUSED`), expected-time draft stop (`TF_DRAFT_COST`, default 0.06 tokens/ms), joint draft pricing (`TF_JOINT_PRICE`, off), trained MTP head loader (`TF_MTP_HEAD`, no weights).
++- Off by default and NOT to be switched on without a quality check: `TF_EXL3_HC_FP8=1` (changes output bits).
++- Server: `/v1/models` `context_length`, `--name-priority`, TPOT histogram, request-end reasons, think-tag handling, open-file limit.
++
++Added here: `prefixes.miss_note` (log line `prefix miss: ... diverges at token N of the M-token kept state` or `no kept state`; `TF_MISS_NOTE=0` off), and the startup line for lone-stream graphs.
++
++## Tests
++
++- CPU (`bin/cpu_pytest.sh`, no GPU): 3,591 passed, 55 skipped (pure SparkFold: 3,567 passed; the difference is my tests). Residency tests need `--ulimit memlock=-1`.
++- Extensions compiled in this image (CUDA 13.3, sm_121): `tensorfold_exl3_experts_v8r` 112 s, `tensorfold_exl3_linear_v4` 58 s, `tensorfold_qwen4_exp_qsa_prompt_p7` 9 s, into `~/.cache/tensorfold-spark`.
++- GPU tests share the live server's GPU, so the memory gate has almost no room: with `TENSORFOLD_MEMORY_RESERVE_GIB=2 TENSORFOLD_CUDA_MEMORY_LIMIT_GB=3` the same 7 tests + 2 errors (growth past first rows, shared-round graphs) fail on merged and on pure SparkFold alike; they need the server stopped.
++
++## Serving
++
++`~/data/runs/llm/start-qwen38-flash-next-exl3-spark.sh` (PROFILE=safe|spark|bare). Rollback: `~/data/runs/llm/start-qwen38-flash-next-exl3-tf.sh` (TF-opt sources, `~/.cache/tensorfold-v065`).
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/multi.py b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+index df8ab4e..950187b 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/multi.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+@@ -135,7 +135,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         while not self.memory_gate.fits(grow + st.layer_bytes(size)):     # a layer's old buffers stay until its copy
+             if self._release_pinned(grow + st.layer_bytes(size)):
+                 continue
+-            if not self._evict_kept(st, protect=protect):
++            if not self._evict_kept(st, protect=protect, need=grow + st.layer_bytes(size)):
+                 if alone:
+                     limit = cuda_limit_bytes() if torch.cuda.is_available() else None
+                     if limit is not None:
+@@ -205,7 +205,19 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+             self._state_changed(st)
+             self.memory_gate.give(-st.resize(min(FIRST, st.limit)))
+ 
+-    def _evict_kept(self, keep: State, *, protect: State | None = None) -> bool:
++    def _evict_note(self, what: str, need: int) -> None:
++        """Say why a kept conversation went: the memory gate refused ``need`` bytes (host MemAvailable less the floor on a unified GPU)."""
++
++        if self.planning:                            # two ranks plan on copies; only the real decoder speaks
++            return
++        gate = self.memory_gate
++        live = gate.live() if gate.live is not None else None
++        seen = f"{live / 2**30:.1f} GiB" if live is not None else "n/a"
++        print(f"[tensorfold] memory gate evicted {what} to grow a cache by {need / 2**30:.2f} GiB: free over the floor {seen}, "
++              f"needs that plus {gate.reserve / 2**30:.1f} GiB; held by streams {gate.held / 2**30:.1f} of {gate.room / 2**30:.1f} GiB "
++              f"(TENSORFOLD_MEMORY_RESERVE_GIB moves the floor)", flush=True)
++
++    def _evict_kept(self, keep: State, *, protect: State | None = None, need: int = 0) -> bool:
+         """Free the oldest idle kept prompt end (never ``keep``); False when none is left."""
+ 
+         busy = self._busy()
+@@ -215,11 +227,13 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+                 self._shrink(st, release=True)
+                 if all(f is not st for f in self.free):
+                     self.free.append(st)
++                self._evict_note(f"a {len(ids)}-token kept state", need)
+                 return True
+         solo = None if self.solo is None else self.solo.st
+         if (solo is not None and solo is not keep and solo is not protect
+                 and id(solo) not in busy and solo.capacity > FIRST):
+             self._shrink(solo, release=True)
++            self._evict_note("the lone-stream graph slot's caches", need)
+             return True
+         return False
+ 
+diff --git a/tests/test_flashnext_evict_note.py b/tests/test_flashnext_evict_note.py
+new file mode 100644
+index 0000000..2a32e02
+--- /dev/null
++++ b/tests/test_flashnext_evict_note.py
+@@ -0,0 +1,30 @@
++"""The memory gate says why it evicted a kept conversation (the numbers a floor change would be judged by)."""
++from types import SimpleNamespace
++
++from tensorfold.cuda.memory_gate import MemoryGate
++from tensorfold.families.qwen4_exp.cuda.multi import MultiDecoder
++
++GIB = 2**30
++
++
++def test_eviction_note_names_the_gate_numbers(capsys) -> None:
++    gate = MemoryGate(33 * GIB, 2 * GIB, live=lambda: int(1.5 * GIB))
++    gate.held = 9 * GIB
++    me = SimpleNamespace(planning=False, memory_gate=gate)
++    MultiDecoder._evict_note(me, "a 144150-token kept state", int(0.2 * GIB))
++    out = capsys.readouterr().out
++    assert "evicted a 144150-token kept state to grow a cache by 0.20 GiB" in out
++    assert "free over the floor 1.5 GiB" in out and "plus 2.0 GiB" in out and "9.0 of 33.0 GiB" in out
++    assert "TENSORFOLD_MEMORY_RESERVE_GIB" in out
++
++
++def test_planning_copies_stay_silent(capsys) -> None:
++    me = SimpleNamespace(planning=True, memory_gate=MemoryGate(GIB, GIB))
++    MultiDecoder._evict_note(me, "x", 1)
++    assert capsys.readouterr().out == ""
++
++
++def test_gate_without_a_live_reading_still_prints(capsys) -> None:
++    me = SimpleNamespace(planning=False, memory_gate=MemoryGate(4 * GIB, 2 * GIB))
++    MultiDecoder._evict_note(me, "the lone-stream graph slot's caches", GIB)
++    assert "free over the floor n/a" in capsys.readouterr().out
