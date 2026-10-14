@@ -112,9 +112,13 @@ State on 2026-10-14, not applied here:
 - **SparkFold branch `h2c`** (unreleased): pinning of the most used system block, re-warming it while idle, a bulk n-gram read-ahead at admission.
   Merging it conflicts in `multi.py` and changes scheduler behaviour.
 - **TensorFold itself.** The Python engine is frozen at 0.6.6 and being retired ([issue #286](https://github.com/ashhart/TensorFold/issues/286)).
-  Its replacement is a native engine written in Zig (v1.0.x) that drives Metal and CUDA with no Python in the serving path. On CUDA it serves
-  Nemotron 3.5 only so far; Qwen3.8-Flash-Next is Metal-only there, and a CUDA port is being worked on by contributors in
-  [issue #472](https://github.com/ashhart/TensorFold/issues/472). It is not usable for this lane yet.
+  Its replacement is a native engine written in Zig (v1.0.x) that drives Metal and CUDA with no Python in the serving path. On `main` the CUDA
+  family is Nemotron 3.5 only; Qwen3.8-Flash-Next on CUDA lives on the `zig-flashnext` branch, which
+  [MiaAI-Lab's recipe](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold) serves with an INT4-AutoRound checkpoint (5
+  experts per token), not EXL3. EXL3 operators for the Zig CUDA engine are open pull requests
+  ([#740](https://github.com/ashhart/TensorFold/pull/740), [#741](https://github.com/ashhart/TensorFold/pull/741)) that no model uses yet, so
+  this lane's pack cannot run on the Zig engine today; the port of Flash Next to `main` is tracked in
+  [issue #472](https://github.com/ashhart/TensorFold/issues/472).
 
 ## Credits
 
