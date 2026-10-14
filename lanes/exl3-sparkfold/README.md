@@ -87,6 +87,7 @@ unset; `TF_EXL3_HC_FP8` off (it changes output bits). `PROFILE=safe` pins the dr
 | Three long conversations taking turns | stock floor 7 of 8 turns re-prefilled, floor 6 GiB 0 of 9 | [memory gate](docs/memory-gate.md) |
 | Spill, 98k-token conversation | 51.9 s cold, 1.0-2.3 s read back, identical replies | [NVMe spill](docs/nvme-spill.md) |
 | `TF_DRAFT_COST` 0.04 / 0.08, `TF_JOINT_PRICE=1` | no gain at one stream; joint pricing -5% at three | [results/2026-10-14](results/2026-10-14-draft-knobs.md) |
+| Prefill and decode by context depth (0 / 4k / 8k) and streams (1 / 2 / 4), llama-benchy | prefill 1.4-1.9k tok/s on a 2k-token piece (1.7-1.9k at 4-8k depth); decode 51-60 tok/s at one stream, 99.5 at four (depth 0); the last two rows overlapped another job | [results/2026-10-14 perf](results/2026-10-14-perf-by-length-and-depth.md) |
 
 Cold prefill here is not faster than the 2,719 tok/s at 30k tokens that the vLLM NVFP4 lane in this repository measured with its own script.
 The two were not measured with the same script or on the same checkpoint, so do not subtract them.
@@ -99,6 +100,9 @@ The two were not measured with the same script or on the same checkpoint, so do 
 - **An unexplained slowdown.** After 19 hours of uptime the earlier local build prefilled at 439-1,062 tok/s instead of 1,341-1,374. Not page
   faults, swap, clocks, core placement or n-gram residency. We did not measure the current build after a comparable uptime.
 - **Spill has not been shown on real traffic**, only in controlled replays ([NVMe spill](docs/nvme-spill.md)).
+- **Other jobs move the numbers.** The CPU and GPU share one memory, and a CPU-heavy job next to the server overlapped the last rows of the
+  2026-10-14 perf run. An earlier run that afternoon, on the container before `xgrammar` was added, had five of six deeper rows at 964-1,358 tok/s
+  against 1,724-1,903 on the idle rerun; we did not record what else was running then and have not found the cause. Run benchmarks on an idle machine.
 - **A restart deletes the server's log.** `start.sh` removes the old container; save `docker logs` first if you want the evidence.
 - **Not measured:** quality of this pack on Korean or on long tool contexts, long-context decode against other engines, any other GB10.
 
