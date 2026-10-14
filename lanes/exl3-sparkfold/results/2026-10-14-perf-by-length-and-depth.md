@@ -2,8 +2,8 @@
 
 llama-benchy (run through [tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench), MIT, commit `46b7865c2`, `--perf-only`) against
 the deployed configuration of this lane: TensorFold 0.6.5 + SparkFold + the [7 patches](../patches/), `--parallel 5 --kv-dtype int8
---mtp-drafts 6`, memory floor 6 GiB, NVMe spill on. The image is the one in the README plus `xgrammar` (structured outputs); the engine code is
-unchanged.
+--mtp-drafts 6`, memory floor 6 GiB, NVMe spill on. The image is the one in the README plus `xgrammar` for structured outputs
+([scripts/xgrammar/Dockerfile](../scripts/xgrammar/Dockerfile)); the engine code is unchanged.
 
 ```
 tool-eval-bench bench --perf-only --base-url http://127.0.0.1:8888 --seed 42 \

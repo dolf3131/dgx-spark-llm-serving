@@ -88,6 +88,7 @@ unset; `TF_EXL3_HC_FP8` off (it changes output bits). `PROFILE=safe` pins the dr
 | Spill, 98k-token conversation | 51.9 s cold, 1.0-2.3 s read back, identical replies | [NVMe spill](docs/nvme-spill.md) |
 | `TF_DRAFT_COST` 0.04 / 0.08, `TF_JOINT_PRICE=1` | no gain at one stream; joint pricing -5% at three | [results/2026-10-14](results/2026-10-14-draft-knobs.md) |
 | Prefill and decode by context depth (0 / 4k / 8k) and streams (1 / 2 / 4), llama-benchy | prefill 1.4-1.9k tok/s on a 2k-token piece (1.7-1.9k at 4-8k depth); decode 51-60 tok/s at one stream, 99.5 at four (depth 0); the last two rows overlapped another job | [results/2026-10-14 perf](results/2026-10-14-perf-by-length-and-depth.md) |
+| Tool calling, tool-eval-bench (97 scenarios) | 90/100 merged (88 for the full run, structured output fixed by installing `xgrammar`); 3 safety-critical failures | [results/2026-10-14 tool-eval](results/2026-10-14-tool-eval.md) |
 
 Cold prefill here is not faster than the 2,719 tok/s at 30k tokens that the vLLM NVFP4 lane in this repository measured with its own script.
 The two were not measured with the same script or on the same checkpoint, so do not subtract them.
