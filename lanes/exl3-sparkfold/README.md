@@ -1,7 +1,7 @@
 # Qwen3.8-Flash-Next on one DGX Spark: EXL3 4.05 bpw on TensorFold / SparkFold
 
-What one Spark serves here since 2026-10-09 (this build since 2026-10-11): turboderp's EXL3 4.05 bpw pack of Qwen3.8-Flash-Next on the
-TensorFold 0.6.5 Python engine, with [SparkFold](https://github.com/grearjake-star/TensorFold)'s GB10 work merged in and seven patches of
+What one Spark serves here since 2026-10-09 (this build since 2026-10-16): turboderp's EXL3 4.05 bpw pack of Qwen3.8-Flash-Next on the
+TensorFold 0.6.5 Python engine, with [SparkFold](https://github.com/grearjake-star/TensorFold)'s GB10 work merged in and nine patches of
 ours on top. Five concurrent streams of 262,144 tokens each, image input, MTP drafting, replies equal to plain decoding.
 
 The engine is a snapshot: TensorFold froze its Python engine (see [Newer upstream work](#newer-upstream-work)), so this lane is pinned
@@ -14,9 +14,9 @@ to a commit and does not follow a release line. Measurements are dated; read [Li
 | Hardware | 1x DGX Spark (GB10, 121 GiB unified memory) |
 | Checkpoint | [`turboderp/Qwen3.8-Flash-Next-exl3`](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3), branch `4.05bpw_h6_ng6`, 99.94 GiB: trunk 62.9 GiB (on the GPU), consolidated n-gram table 36.36 GiB (memory-mapped), vision sidecar 0.52 GiB, MTP head included |
 | Per decoded token | 5.28 GB read (by header arithmetic), against 7.09 GB for an NVFP4 QAD build we served before (a different checkpoint from the one the vLLM lane uses) |
-| Engine | TensorFold 0.6.5 (Python) + SparkFold `806b345` + [7 patches](patches/), source mounted over the image `tensorfold-qwen38:v0.3.6.3` |
-| Serving | `--parallel 5 --context 262144 --kv-dtype int8 --mtp-drafts 6 --mtp-confidence 0.60 --thinking --vision`, memory floor 6 GiB, NVMe spill on |
-| Decode | single stream, 600-token windows: English 57.4-57.9, Korean 41.8-43.3 tok/s; 128-token windows on short prompts: median 71 tok/s |
+| Engine | TensorFold 0.6.5 (Python) + SparkFold `806b345` + [9 patches](patches/), source mounted over the image `tensorfold-qwen38:v0.3.6.3` |
+| Serving | `--parallel 5 --context 262144 --kv-dtype int8 --mtp-drafts 6 --mtp-confidence 0.60 --thinking --vision`, memory floor 6 GiB, NVMe spill on, MTP draft list with Hangul tokens |
+| Decode | single stream, 600-token windows (2026-10-16): English 59, Korean 49 tok/s on average over the bench prompts (Korean was about 42 before the Hangul draft list); 128-token windows on short prompts: median 71 tok/s |
 | Cold prefill | 1.8-2.1k tok/s from 1.9k to 49k prompt tokens (real English/Korean text) |
 | Resuming a 100k-token conversation after an eviction | 40-50 s from scratch, 0.8-2.3 s from NVMe (controlled replay) |
 | Cold start | about 90 s once the extensions are built; the first start compiles three extensions (about three minutes) |
@@ -28,7 +28,7 @@ measured quality ourselves.
 
 | | |
 |---|---|
-| [patches/](patches/) | the 7 patches, `apply.sh` to build the tree, licence and authorship notes |
+| [patches/](patches/) | the 9 patches, `apply.sh` to build the tree, licence and authorship notes |
 | [scripts/start.sh](scripts/start.sh) | the `docker run` for this lane, with profiles and knobs |
 | [docs/](docs/) | [the memory gate](docs/memory-gate.md), [NVMe spill](docs/nvme-spill.md), [quoted special tokens](docs/quoted-special-tokens.md) |
 | [results/](results/) | dated measurements |
@@ -49,7 +49,7 @@ measured quality ourselves.
    PyTorch 26.07 container. Steps 3 and 4 of that script fetch that wrapper's own MLX checkpoint, which this lane does not use. The image only
    supplies PyTorch and the dependencies: the TensorFold source mounted in step 4 replaces the code inside it. Ours carries the label
    `tf.patches=c1f5d72f8d16`.
-4. **The patched tree.** `patches/apply.sh ~/tensorfold-src` (SparkFold at `806b345` plus the seven patches).
+4. **The patched tree.** `patches/apply.sh ~/tensorfold-src` (SparkFold at `806b345` plus the nine patches).
 5. **Vision (optional).** Convert the pack's `vision_k6.safetensors` once with `python -m tensorfold.vision.exl3_convert` (run it in the image with
    `PYTHONPATH` at the tree; see the module's `--help` for its arguments) and keep the result as `$CACHE/vision-f16-v3.safetensors`
    (898 MB). Or start with `VISION=0`. We ran this conversion once, on 2026-10-09.
@@ -74,6 +74,7 @@ shared box needs and what you must not do on an untrusted network.
 | `TF_SOLO_ROWS` | 65536 | lone-stream graph slot pre-sized to 64K rows, buckets captured at start (1.1 GiB) |
 | `TF_KEEP` / `TF_FIRST_PASS` / `TF_PASS_MIN` | 16 / 1024 / 1024 | kept states per pool, prompt pass sizes beside live streams |
 | `TENSORFOLD_PREFILL_ROWS` / `TF_EXL3_MOE_WINDOW` | 4096 / 4096 | prompt pieces and routed-expert windows |
+| `TF_DRAFT_VOCAB` | `draft_vocab_ko.txt` | MTP draft list with the 6,641 Hangul tokens the stock list lacks (patch 0009); speed only. Set by `start.sh` outside the profiles, `DRAFT_VOCAB=` turns it off |
 
 Left at the tree's defaults: `TF_DRAFT_COST` 0.06, `TF_MULTI_GRAPHS`, fused routing, stage batch, decode and n-gram read-ahead; `TF_NGRAM_LOCK`
 unset; `TF_EXL3_HC_FP8` off (it changes output bits). `PROFILE=safe` pins the draft cost and shared-round graphs back to the old policy.
@@ -89,6 +90,8 @@ unset; `TF_EXL3_HC_FP8` off (it changes output bits). `PROFILE=safe` pins the dr
 | `TF_DRAFT_COST` 0.04 / 0.08, `TF_JOINT_PRICE=1` | no gain at one stream; joint pricing -5% at three | [results/2026-10-14](results/2026-10-14-draft-knobs.md) |
 | Prefill and decode by context depth (0 / 4k / 8k) and streams (1 / 2 / 4), llama-benchy | prefill 1.4-1.9k tok/s on a 2k-token piece (1.7-1.9k at 4-8k depth); decode 51-60 tok/s at one stream, 99.5 at four (depth 0); the last two rows overlapped another job | [results/2026-10-14 perf](results/2026-10-14-perf-by-length-and-depth.md) |
 | Tool calling, tool-eval-bench (97 scenarios) | 90/100 merged (88 for the full run, structured output fixed by installing `xgrammar`); 3 safety-critical failures | [results/2026-10-14 tool-eval](results/2026-10-14-tool-eval.md) |
+| Hangul draft list (patch 0009) | Korean draft acceptance 0.32-0.49 to 0.51-0.61, Korean decode about 42 to 49 tok/s; English greedy replies byte-identical | [results/2026-10-16](results/2026-10-16-ko-draft-vocab-and-decode-profile.md) |
+| Decode round, nsys | median 39.7 ms: main verify graph 34.3 (85%), drafts 2.6, idle gaps 2.4; large kernels at ~77-91% of sustained bandwidth, no single waste | same |
 
 Cold prefill here is not faster than the 2,719 tok/s at 30k tokens that the vLLM NVFP4 lane in this repository measured with its own script.
 The two were not measured with the same script or on the same checkpoint, so do not subtract them.
@@ -101,6 +104,8 @@ The two were not measured with the same script or on the same checkpoint, so do 
 - **An unexplained slowdown.** After 19 hours of uptime the earlier local build prefilled at 439-1,062 tok/s instead of 1,341-1,374. Not page
   faults, swap, clocks, core placement or n-gram residency. We did not measure the current build after a comparable uptime.
 - **Spill has not been shown on real traffic**, only in controlled replays ([NVMe spill](docs/nvme-spill.md)).
+- **Tool-call arguments.** Since patch 0008 a `</tool_call>` inside an argument stays text, but an argument value still ends at a quoted
+  `</parameter>`. In one live check the model ended its own turn right before the closing tag; no parser fixes that.
 - **Other jobs move the numbers.** The CPU and GPU share one memory, and a CPU-heavy job next to the server overlapped the last rows of the
   2026-10-14 perf run. An earlier run that afternoon, on the container before `xgrammar` was added, had five of six deeper rows at 964-1,358 tok/s
   against 1,724-1,903 on the idle rerun; we did not record what else was running then and have not found the cause. Run benchmarks on an idle machine.
@@ -129,6 +134,7 @@ State on 2026-10-14, not applied here:
 
 [TensorFold](https://github.com/ashhart/TensorFold) (ashhart and contributors) is the engine; [SparkFold](https://github.com/grearjake-star/TensorFold)
 (grearjake-star) is the GB10 fork this lane builds on, and its CHANGELOG credits the contributors whose changes it carries.
-[MiaAI-Lab](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold) provides the image recipe. The EXL3 pack is
+[MiaAI-Lab](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold) provides the image recipe. The tool-call block-end rule
+of patch 0008 follows [veloGB10](https://github.com/sf-stav/veloGB10). The EXL3 pack is
 [turboderp](https://huggingface.co/turboderp)'s, quantized with ExLlamaV3; the weights are the Qwen team's, under their `qwen-community-1.0`
 licence, and nothing here redistributes them.

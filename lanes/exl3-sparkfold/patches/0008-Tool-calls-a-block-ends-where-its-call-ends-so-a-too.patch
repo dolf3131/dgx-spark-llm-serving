@@ -1,0 +1,339 @@
+From f2fce2f8dbe230035346d2abe19c52ed9fc575ad Mon Sep 17 00:00:00 2001
+From: dolf3131 <144650661+dolf3131@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 01:05:31 +0900
+Subject: [PATCH 8/9] Tool calls: a block ends where its call ends, so a
+ </tool_call> inside an argument is text
+
+vLLM's Qwen parser and veloGB10 0.7.4 (--tool-block-end after-function): a close ends the block only
+after </function> or </parameter> (JSON body: }) and when it does not pay for a <tool_call> the block
+itself opened; a finished reply falls back to the first close, a streaming one waits. Applied to the
+end parser, the streamed content and the single-call filter. Complements the prompt-side escape,
+which cannot cover a tag the model writes itself.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/tensorfold/cuda/reply_text.py    | 19 +++---
+ src/tensorfold/server/tool_policy.py |  8 +++
+ src/tensorfold/server/tools.py       | 70 +++++++++++++++++++++
+ tests/test_cuda_server_tool_slips.py | 32 ++++++++++
+ tests/test_tool_block_end.py         | 91 ++++++++++++++++++++++++++++
+ 5 files changed, 210 insertions(+), 10 deletions(-)
+ create mode 100644 tests/test_tool_block_end.py
+
+diff --git a/src/tensorfold/cuda/reply_text.py b/src/tensorfold/cuda/reply_text.py
+index a47f1ef..e6460fb 100644
+--- a/src/tensorfold/cuda/reply_text.py
++++ b/src/tensorfold/cuda/reply_text.py
+@@ -8,11 +8,10 @@ import uuid
+ from typing import Any
+ 
+ from tensorfold.server.stopping import StopPolicy
+-from tensorfold.server.tools import call_name, parse_glm_tool_call_block
++from tensorfold.server.tools import call_name, parse_glm_tool_call_block, tool_call_blocks, tool_call_close
+ from tensorfold.tool_parameters import decode_parameter, parameter_schemas
+ 
+ _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
+-_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
+ _TOOL_FUNCTION_BLOCK_RE = re.compile(r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$", re.IGNORECASE | re.DOTALL)
+ _TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.IGNORECASE | re.DOTALL)
+ 
+@@ -95,7 +94,7 @@ def hide_tool_calls(text: str, *, finished: bool) -> str:
+             out.append(tail[: len(tail) - (0 if finished else _partial_tag(tail, _CALL_OPEN))])
+             return "".join(out)
+         out.append(text[pos:start])
+-        end = text.find(_CALL_CLOSE, start)
++        end = tool_call_close(text, start + len(_CALL_OPEN), finished=finished)    # a </tool_call> in an argument is text
+         if end < 0:
+             return "".join(out)
+         pos = end + len(_CALL_CLOSE)
+@@ -119,12 +118,12 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
+     calls: list[dict[str, Any]] = []
+     residue: list[str] = []
+     cursor = 0
+-    for match in _TOOL_CALL_BLOCK_RE.finditer(text):
+-        residue.append(text[cursor:match.start()])
+-        cursor = match.end()
++    for start, end, block in tool_call_blocks(text):       # a block ends where its call ends (``tool_call_close``)
++        whole = text[start:end]
++        residue.append(text[cursor:start])
++        cursor = end
+         if max_calls is not None and len(calls) >= max_calls:
+             continue
+-        block = match.group(1).strip()
+         name, args = None, {}
+         try:
+             payload = json.loads(block)
+@@ -138,7 +137,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
+             m = _TOOL_FUNCTION_BLOCK_RE.match(block)
+             if m:
+                 if max_calls is not None and _TOOL_PARAMETER_BLOCK_RE.sub("", m.group(2)).strip():
+-                    residue.append(match.group(0))
++                    residue.append(whole)
+                     continue
+                 name = m.group(1).strip()
+                 # typed parameters (array, object, number...) decode per the tool's schema, as the Mac server does
+@@ -152,7 +151,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
+                     name, args = glm
+         tool = call_name(name, known, args)
+         if tool is None:
+-            residue.append(match.group(0))          # a malformed call stays text, in either mode
++            residue.append(whole)          # a malformed call stays text, in either mode
+             continue
+         if max_calls is not None:
+             try:
+@@ -160,7 +159,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
+                     raise TypeError(args)
+                 json.dumps(args, allow_nan=False)
+             except (ValueError, TypeError):
+-                residue.append(match.group(0))
++                residue.append(whole)
+                 continue
+         calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
+                       "function": {"name": tool,
+diff --git a/src/tensorfold/server/tool_policy.py b/src/tensorfold/server/tool_policy.py
+index ebac61b..c6dc40d 100644
+--- a/src/tensorfold/server/tool_policy.py
++++ b/src/tensorfold/server/tool_policy.py
+@@ -2,6 +2,7 @@ import re
+ from typing import Any
+ 
+ from tensorfold.server.errors import RequestError
++from tensorfold.server.tools import tool_call_close
+ 
+ _WHOLE_ENVELOPE_RE = re.compile(r"<((?:[A-Za-z_][\w.-]*:)?tool_call)>.*?</\1>", re.IGNORECASE | re.DOTALL)
+ 
+@@ -17,6 +18,13 @@ class _ToolTextFilter:
+         self.pending += text
+         out = []
+         while self.pending:
++            if self.hidden == "tool_call":             # Qwen's block ends where its call ends, not at a quoted close
++                end = tool_call_close(self.pending, 0, finished=False)
++                if end < 0:
++                    break
++                self.pending = self.pending[end + len("</tool_call>"):]
++                self.hidden = None
++                continue
+             if self.hidden:
+                 close = f"</{self.hidden}>"
+                 end = self.pending.lower().find(close)
+diff --git a/src/tensorfold/server/tools.py b/src/tensorfold/server/tools.py
+index f8ea082..4616f81 100644
+--- a/src/tensorfold/server/tools.py
++++ b/src/tensorfold/server/tools.py
+@@ -86,6 +86,76 @@ def active_tool_specs(tools: Any, tool_choice: Any) -> list[dict[str, Any]]:
+     return specs
+ 
+ 
++_CALL_OPEN_RE = re.compile(re.escape("<tool_call>"), re.IGNORECASE)
++_CALL_CLOSE_RE = re.compile(re.escape("</tool_call>"), re.IGNORECASE)
++_CLOSE_CANDIDATES = 4096     # closes one block examines per pass; past it the first close ends the block (the old rule)
++
++
++def _ends_like_a_call(text: str, start: int, at: int) -> bool:
++    """``text[start:at]`` ends where a finished call ends, white space aside: ``</function>`` or ``</parameter>`` (a
++    JSON body, one that starts with ``{``: ``}``)."""
++
++    end = at
++    while end > start and text[end - 1].isspace():
++        end -= 1
++    first = start
++    while first < end and text[first].isspace():
++        first += 1
++    if first < end and text[first] == "{":
++        return text[end - 1] == "}"
++    tail = text[max(start, end - len("</parameter>")):end].lower()
++    return tail.endswith("</function>") or tail.endswith("</parameter>")
++
++
++def tool_call_close(text: str, start: int, *, finished: bool = True) -> int:
++    """Where the ``<tool_call>`` block whose body starts at ``start`` ends: the index of its ``</tool_call>``, or -1.
++
++    The format has no escaping, so an argument can hold the text ``</tool_call>`` (a file about tool calls). A close
++    ends the block only where the call has ended, as vLLM's Qwen parser and veloGB10 0.7.4 read it: the text before it
++    ends with ``</function>`` or ``</parameter>`` (a JSON body: ``}``), and it does not close a ``<tool_call>`` the block
++    itself opened (a quoted complete block inside an argument is text). A finished reply then retries without that
++    debt (prose that mentions ``<tool_call>`` once owes nothing) and, when still no close qualifies, ends the block at
++    its first close, the old rule. A reply still streaming waits for more text instead (-1), so nothing past a quoted
++    close is shown early."""
++
++    closes = []
++    for m in _CALL_CLOSE_RE.finditer(text, start):
++        closes.append(m.start())
++        if len(closes) == _CLOSE_CANDIDATES:
++            break
++    if not closes:
++        return -1
++    opens = [m.start() for m in _CALL_OPEN_RE.finditer(text, start, closes[-1])]
++    owed, o = 0, 0
++    for at in closes:
++        while o < len(opens) and opens[o] < at:
++            owed, o = owed + 1, o + 1
++        if owed:
++            owed -= 1
++            continue
++        if _ends_like_a_call(text, start, at):
++            return at
++    if not finished:
++        return closes[0] if len(closes) == _CLOSE_CANDIDATES else -1
++    return next((at for at in closes if _ends_like_a_call(text, start, at)), closes[0])
++
++
++def tool_call_blocks(text: str) -> list[tuple[int, int, str]]:
++    """A finished reply's closed ``<tool_call>`` blocks under ``tool_call_close``: (start, end, body stripped)."""
++
++    out, pos = [], 0
++    while True:
++        m = _CALL_OPEN_RE.search(text, pos)
++        if m is None:
++            return out
++        close = tool_call_close(text, m.end())
++        if close < 0:
++            return out
++        end = close + len("</tool_call>")
++        out.append((m.start(), end, text[m.end():close].strip()))
++        pos = end
++
++
+ _TOOL_CALL_BLOCK_RE = re.compile(
+     r"<tool_call>\s*(.*?)\s*</tool_call>",
+     re.IGNORECASE | re.DOTALL,
+diff --git a/tests/test_cuda_server_tool_slips.py b/tests/test_cuda_server_tool_slips.py
+index 155e7df..ed060a9 100644
+--- a/tests/test_cuda_server_tool_slips.py
++++ b/tests/test_cuda_server_tool_slips.py
+@@ -77,3 +77,35 @@ def test_a_call_to_an_undeclared_name_goes_to_the_client(tmp_path, stream) -> No
+ def test_prose_that_mentions_the_tag_is_still_content(tmp_path, stream) -> None:
+     finish, content, calls = reply(tmp_path, "Use the <tool_call> tag to call tools.", stream)
+     assert finish == "stop" and not calls and "<tool_call>" in content
++
++
++QUOTING = ("<tool_call>\n<function=run_notebook_cell>\n<parameter=cellId>\n#VSC-1\n</parameter>\n<parameter=filePath>\n"
++           "pattern = r\"<tool_call>(.*?)</tool_call>\"\n</parameter>\n</function>\n</tool_call>")
++
++
++@pytest.mark.parametrize("stream", [False, True])
++@pytest.mark.parametrize("parallel", [True, False])
++def test_an_argument_that_holds_a_close_tag_is_one_whole_call(tmp_path, stream, parallel) -> None:
++    engine = OneShotEngine(QUOTING)
++    with serving(app_for(tmp_path, engine)) as port:
++        status, raw = post(port, {**BODY, "stream": stream, "parallel_tool_calls": parallel})
++    assert status == 200, raw
++    if stream:
++        content, calls, finish = "", {}, None
++        for line in raw.splitlines():
++            if line.startswith("data: ") and line != "data: [DONE]":
++                choice = json.loads(line[6:])["choices"][0]
++                content += choice["delta"].get("content") or ""
++                for tc in choice["delta"].get("tool_calls") or []:
++                    c = calls.setdefault(tc["index"], ["", ""])
++                    c[0] += tc["function"].get("name") or ""
++                    c[1] += tc["function"].get("arguments") or ""
++                finish = choice.get("finish_reason") or finish
++        calls = [tuple(v) for _, v in sorted(calls.items())]
++    else:
++        choice = json.loads(raw)["choices"][0]
++        finish, content = choice["finish_reason"], choice["message"].get("content") or ""
++        calls = [(c["function"]["name"], c["function"]["arguments"]) for c in choice["message"].get("tool_calls") or []]
++    assert finish == "tool_calls" and content.strip() == "", (finish, content)
++    assert [c[0] for c in calls] == ["run_notebook_cell"]
++    assert json.loads(calls[0][1]) == {"cellId": "#VSC-1", "filePath": 'pattern = r"<tool_call>(.*?)</tool_call>"'}
+diff --git a/tests/test_tool_block_end.py b/tests/test_tool_block_end.py
+new file mode 100644
+index 0000000..1f9083b
+--- /dev/null
++++ b/tests/test_tool_block_end.py
+@@ -0,0 +1,91 @@
++"""A </tool_call> inside an argument (a file about tool calls) is text: a block ends where its call ends, as vLLM's Qwen
++parser and veloGB10 0.7.4 read it, in the end parser, the streamed content and the single-call filter."""
++import json
++
++import pytest
++
++from tensorfold.cuda.reply_text import hide_tool_calls, parse_tool_calls
++from tensorfold.server.tool_policy import _ToolTextFilter
++from tensorfold.server.tools import tool_call_close
++
++TOOLS = [{"type": "function", "function": {"name": "write_file", "parameters": {"type": "object", "properties": {
++    "path": {"type": "string"}, "content": {"type": "string"}}}}}]
++
++
++def call(content: str, path: str = "parse.py") -> str:
++    return ("<tool_call>\n<function=write_file>\n<parameter=path>\n" + path + "\n</parameter>\n<parameter=content>\n"
++            + content + "\n</parameter>\n</function>\n</tool_call>")
++
++
++QUOTED_CLOSE = 'pattern = r"<tool_call>(.*?)</tool_call>"\nprint(pattern)'
++LONE_CLOSE = "the block ends with </tool_call> and nothing else"
++QUOTED_BLOCK = "Example:\n<tool_call>\n<function=f>\n<parameter=a>\n1\n</parameter>\n</function>\n</tool_call>\nDone."
++MENTION = "wrap every call in <tool_call> tags"
++
++
++def args(calls):
++    return [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls or []]
++
++
++@pytest.mark.parametrize("value", [QUOTED_CLOSE, LONE_CLOSE, MENTION])
++def test_a_value_that_quotes_the_tags_is_read_whole(value) -> None:
++    content, calls = parse_tool_calls(call(value), TOOLS)
++    assert content == "" and args(calls) == [("write_file", {"path": "parse.py", "content": value})]
++
++
++def test_a_quoted_complete_block_stays_inside_one_call() -> None:
++    """The block ends at the real close (no leftover markup as content); the VALUE still ends at the first
++    </parameter>, the value rule's known limit (veloGB10 0.7.4 leaves it too, behind opt-in flags)."""
++
++    content, calls = parse_tool_calls(call(QUOTED_BLOCK), TOOLS)
++    assert content == "" and args(calls) == [
++        ("write_file", {"path": "parse.py", "content": QUOTED_BLOCK[:QUOTED_BLOCK.index("\n</parameter>")]})]
++
++
++def test_before_the_fix_the_first_close_cut_the_call() -> None:
++    text = call(QUOTED_CLOSE)
++    start = text.index("<tool_call>") + len("<tool_call>")
++    assert tool_call_close(text, start) == text.rindex("</tool_call>") != text.index("</tool_call>")
++
++
++def test_two_real_calls_stay_two_and_prose_after_them_is_content() -> None:
++    text = call(QUOTED_CLOSE, "a.py") + "\n" + call("x = 1", "b.py") + "\nBoth written."
++    content, calls = parse_tool_calls(text, TOOLS)
++    assert args(calls) == [("write_file", {"path": "a.py", "content": QUOTED_CLOSE}),
++                           ("write_file", {"path": "b.py", "content": "x = 1"})]
++    assert content == "Both written."
++
++
++def test_a_block_without_a_function_close_ends_at_its_first_close_as_before() -> None:
++    text = "<tool_call>\n<function=write_file>\n<parameter=path>\nq\n</tool_call>\nafter"
++    content, calls = parse_tool_calls(text, TOOLS)
++    assert calls is None and content == text
++
++
++def test_an_unclosed_block_stays_text_as_before() -> None:
++    text = "<tool_call>\n<function=write_file>\n<parameter=path>\nq\n</parameter>\n</function>\n"
++    assert parse_tool_calls(text, TOOLS) == (text.strip(), None)
++
++
++def test_a_json_body_ends_at_its_closing_brace() -> None:
++    text = '<tool_call>\n{"name": "write_file", "arguments": {"path": "p", "content": "</tool_call>"}}\n</tool_call>'
++    content, calls = parse_tool_calls(text, TOOLS)
++    assert content == "" and args(calls) == [("write_file", {"path": "p", "content": "</tool_call>"})]
++
++
++@pytest.mark.parametrize("value", [QUOTED_CLOSE, LONE_CLOSE, QUOTED_BLOCK, MENTION])
++def test_streamed_content_never_shows_a_value(value) -> None:
++    text = "Writing it.\n" + call(value) + "\nDone."
++    final = hide_tool_calls(text, finished=True)
++    assert final == "Writing it.\nDone." or final == "Writing it.\n\nDone."
++    for n in range(len(text) + 1):
++        shown = hide_tool_calls(text[:n], finished=False)
++        assert final.startswith(shown), (n, shown)
++
++
++@pytest.mark.parametrize("value", [QUOTED_CLOSE, LONE_CLOSE, QUOTED_BLOCK])
++def test_the_single_call_filter_hides_the_whole_block(value) -> None:
++    text = "Writing it.\n" + call(value) + "\nDone."
++    f = _ToolTextFilter()
++    shown = "".join(f.feed(ch) for ch in text) + f.finish()
++    assert shown == "Writing it.\n\nDone."
+-- 
+2.43.0
+

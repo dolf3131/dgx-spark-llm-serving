@@ -4,6 +4,7 @@
 #
 #   TF_SRC=~/tensorfold-src ./start.sh                  # PROFILE=spark (default): SparkFold's settings + a 6 GiB memory floor + NVMe spill
 #   SPILL=0 TF_SRC=... ./start.sh                       # no NVMe spill
+#   DRAFT_VOCAB= TF_SRC=... ./start.sh                  # MTP drafts from the stock draft list instead of draft_vocab_ko.txt (patch 0009)
 #   PROFILE=safe TF_SRC=... ./start.sh                  # SparkFold's code with the old decoding policy (no draft-cost stop, eager shared rounds)
 #   KNOBS="TF_KEEP=16 TF_FRESH_SLACK=4096" TF_SRC=... ./start.sh   # extra TF_* env on top of the profile (later entries win)
 #   DRY_RUN=1 TF_SRC=... ./start.sh                     # print the docker command only
@@ -49,6 +50,7 @@ CONTEXT="${CONTEXT:-262144}"
 KV_DTYPE="${KV_DTYPE:-int8}"
 PROFILE="${PROFILE:-spark}"
 KNOBS="${KNOBS:-}"
+DRAFT_VOCAB="${DRAFT_VOCAB-draft_vocab_ko.txt}"   # stock draft list + its 6,641 missing Hangul tokens (patch 0009): speed only, drafts are verified; empty = stock list
 
 case "${PROFILE}" in
   safe)  PROFILE_ENV="TF_DRAFT_COST=off TF_MULTI_GRAPHS=0 TF_SOLO_ROWS=${SOLO_ROWS:-65536} TENSORFOLD_MEMORY_RESERVE_GIB=${RESERVE_GIB:-6}"; PIN_EXTRA_GIB="${PIN_EXTRA_GIB:--6.2}" ;;
@@ -59,8 +61,10 @@ esac
 SPILL="${SPILL:-1}"            # idle conversations' kept states go to NVMe instead of being dropped (../docs/nvme-spill.md); SPILL=0 off
 SPILL_ENV=""
 if [[ "${SPILL}" == 1 ]]; then SPILL_ENV="TF_SPILL_DIR=/cache/spill TF_SPILL_GIB=${SPILL_GIB:-48} TF_SPILL_MIN=${SPILL_MIN:-16384}"; fi
+VOCAB_ENV=""
+if [[ -n "${DRAFT_VOCAB}" ]]; then VOCAB_ENV="TF_DRAFT_VOCAB=${DRAFT_VOCAB}"; fi   # part of the spill signature: changing it drops stored spill states once
 KNOB_ARGS=()
-for kv in ${PROFILE_ENV} ${SPILL_ENV} ${KNOBS}; do
+for kv in ${PROFILE_ENV} ${SPILL_ENV} ${VOCAB_ENV} ${KNOBS}; do
   [[ "${kv}" == *=* ]] || { echo "FATAL: knob '${kv}' is not NAME=VALUE" >&2; exit 1; }
   KNOB_ARGS+=(-e "${kv}")
 done
@@ -113,5 +117,5 @@ if [[ "${DRY_RUN:-0}" == 1 ]]; then printf '%q ' "${CMD[@]}"; echo; exit 0; fi
 # a restart deletes the old container's log: keep it first if you want it (docker logs ${NAME} > somewhere)
 docker rm -f "${NAME}" >/dev/null 2>&1 || true
 "${CMD[@]}" >/dev/null
-echo "started ${NAME} (PROFILE=${PROFILE}, model=${MODEL}, vision=${VISION}, parallel=${PARALLEL}, context=${CONTEXT}, kv=${KV_DTYPE}, publish=${PUBLISH}, knobs: ${PROFILE_ENV} ${SPILL_ENV} ${KNOBS})"
+echo "started ${NAME} (PROFILE=${PROFILE}, model=${MODEL}, vision=${VISION}, parallel=${PARALLEL}, context=${CONTEXT}, kv=${KV_DTYPE}, publish=${PUBLISH}, knobs: ${PROFILE_ENV} ${SPILL_ENV} ${VOCAB_ENV} ${KNOBS})"
 echo "follow with: docker logs -f ${NAME}"

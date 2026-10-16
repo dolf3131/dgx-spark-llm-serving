@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the patched TensorFold tree this lane runs:
-#   SparkFold spark-exl3 @ 806b345 (itself TensorFold 0.6.5, commit 609ca41, plus 89 commits)  ->  0001 applied as one commit  ->  0002..0007 with git am
+#   SparkFold spark-exl3 @ 806b345 (itself TensorFold 0.6.5, commit 609ca41, plus 89 commits)  ->  0001 applied as one commit  ->  0002..0009 with git am
 #
 #   ./apply.sh ~/tensorfold-src
 #   SPARKFOLD_URL=/path/to/a/local/SparkFold/clone ./apply.sh ~/tensorfold-src      # skip the download
@@ -20,7 +20,7 @@ git fetch -q "${SPARKFOLD_URL}" spark-exl3
 git checkout -q "${BASE}"
 git -c user.name=apply -c user.email=apply@localhost apply --index "${HERE}/0001-carry-over-tf-opt-local-fixes.patch"
 git -c user.name=apply -c user.email=apply@localhost commit -q -m "carry-over of local fixes (see patches/0001)"
-for p in "${HERE}"/000[2-7]*.patch; do
+for p in "${HERE}"/000[2-9]*.patch; do
   git -c user.name=apply -c user.email=apply@localhost am -q "${p}"
 done
-echo "built ${OUT} at $(git rev-parse --short HEAD) (SparkFold ${BASE} + 7 patches)"
+echo "built ${OUT} at $(git rev-parse --short HEAD) (SparkFold ${BASE} + 9 patches)"
