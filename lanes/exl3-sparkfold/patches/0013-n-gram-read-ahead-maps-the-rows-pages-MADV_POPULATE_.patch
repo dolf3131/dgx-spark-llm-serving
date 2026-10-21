@@ -1,0 +1,194 @@
+From 9ee457c958328851c8b748c213ccc4bdd9735a04 Mon Sep 17 00:00:00 2001
+From: dolf3131 <144650661+dolf3131@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 18:41:32 +0900
+Subject: [PATCH] n-gram read-ahead maps the rows' pages (MADV_POPULATE_READ,
+ TF_NGRAM_POPULATE); drop TF_ABSORB_FIRST
+
+MADV_WILLNEED only reads a row's page into the page cache, so stage's gather on the decode critical path still took a
+minor fault per row (real 36 GiB table, 48 rows: 0.131 ms after WILLNEED, 0.015 ms after POPULATE_READ, 0.016 ms on
+mapped rows; stage17 gather_bench.py). The background read-ahead now populates (maps) them; a kernel that refuses it
+falls back to WILLNEED. Values gathered are unchanged.
+
+TF_ABSORB_FIRST is removed: on the real lane (boot B, 2026-10-17) commit's host time was hidden but the first draft
+pick then waited for commit's DeltaNet replays, net ~0; the round profile marks stay.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../families/qwen4_exp/cuda/decode.py         | 12 ++----
+ .../families/qwen4_exp/cuda/decode_ahead.py   |  5 ++-
+ .../families/qwen4_exp/cuda/exl3_pack.py      | 15 ++++++-
+ .../families/qwen4_exp/cuda/multi_solo.py     | 40 +++++--------------
+ 4 files changed, 31 insertions(+), 41 deletions(-)
+
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/decode.py b/src/tensorfold/families/qwen4_exp/cuda/decode.py
+index edca032b..5f743839 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/decode.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/decode.py
+@@ -267,26 +267,22 @@ def absorb(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int]) -> torc
+ 
+ 
+ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position: int, count: int,
+-          sampling: Sampling | None, confidence: float = 0.0, cost: float = 0.0, ahead=None,
+-          after_absorb=None) -> list[int]:
++          sampling: Sampling | None, confidence: float = 0.0, cost: float = 0.0, ahead=None) -> list[int]:
+     """Absorb kept rows and chain drafts, always retaining the first even below ``confidence``, then stopping before later drafts below it or after a low-confidence first draft.
+ 
+     ``cost`` > 0 (tokens per ms) also stops before a later draft whose chance of being reached and kept, the product
+     of the head's probabilities of drafts 1..j, is under its bar (``cost_bars``): a long chain of middling drafts
+     costs verify rows it rarely repays. The MTP step of a draft the product already fails is skipped (products only
+     fall). Speed only: drafts never change the output. ``ahead`` (decode_ahead.Rows, key 0): each draft's n-gram
+-    pages are asked for once the next MTP step is launched (residency only). ``after_absorb``: host work run right
+-    after the absorb step is launched, while it is on the GPU (the lone stream's commit, TF_ABSORB_FIRST)."""
++    pages are asked for once the next MTP step is launched (residency only)."""
+ 
+     st = e.st
+     prof = PROFILE
+     logits = absorb(e, streams, next_tokens)
+-    if prof is not None:
+-        prof.mark("absorb launch*")
+-    if after_absorb is not None:
+-        after_absorb()
+     if ahead is not None:
+         ahead.send()                                     # row 0 while the absorb step runs
++    if prof is not None:
++        prof.mark("absorb launch*")
+     drafts: list[int] = []
+     bars = cost_bars(cost, count, getattr(e, "timing", None)) if cost > 0 else None
+     chain = 1.0
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/decode_ahead.py b/src/tensorfold/families/qwen4_exp/cuda/decode_ahead.py
+index 294204cc..0a4dc7e7 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/decode_ahead.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/decode_ahead.py
+@@ -5,8 +5,9 @@ queued on the GPU between the last draft pick and the next verify launch. A row
+ of the table (and not in the page cache) costs a major fault there, ~0.44 ms with the GIL held (C2). A window's rows
+ are known one at a time well before ``stage``: row 0 (the round's end token) once verify's sampling has run, and each
+ draft once its pick is read back, while the next MTP step still runs. Here each row's table ids go to a background
+-thread as soon as the row is known, and it asks the kernel for their pages (MADV_WILLNEED through ctypes: the GIL is
+-released and the reads run asynchronously), so ``stage``'s gather finds them read. Residency only: ``stage`` and
++thread as soon as the row is known, and it asks the kernel for their pages through ctypes (the GIL is released):
++MADV_POPULATE_READ by default, which also maps them into the process so ``stage``'s gather takes no minor fault per row,
++or MADV_WILLNEED (TF_NGRAM_POPULATE=0: asynchronous, page cache only; see NgramTable.willneed). Residency only: ``stage`` and
+ every value it gathers are unchanged, and nothing here touches the GPU. TF_DECODE_AHEAD=0: nothing is asked for.
+ """
+ 
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/exl3_pack.py b/src/tensorfold/families/qwen4_exp/cuda/exl3_pack.py
+index 76b2cd7e..580af6aa 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/exl3_pack.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/exl3_pack.py
+@@ -124,6 +124,11 @@ class Pack:
+         return torch.from_numpy(fmt.unpack_signs(self.get(f"{prefix}.{packed}").numpy()))
+ 
+ 
++WILLNEED, POPULATE_READ = mmap.MADV_WILLNEED, 22          # MADV_POPULATE_READ (Linux 5.14)
++_ADVICE = WILLNEED if os.environ.get("TF_NGRAM_POPULATE", "1").strip().lower() in ("0", "off", "false", "no") \
++    else POPULATE_READ
++
++
+ @functools.lru_cache(maxsize=1)
+ def _libc():
+     import ctypes
+@@ -214,7 +219,10 @@ class NgramTable(_Residency):
+         return out.view(np.int16)
+ 
+     def willneed(self, ids: np.ndarray) -> int:
+-        """Ask the kernel to read rows ``ids``' pages ahead (MADV_WILLNEED, asynchronous; ctypes drops the GIL)."""
++        """Ask the kernel to read rows ``ids``' pages ahead; ctypes drops the GIL. MADV_POPULATE_READ (Linux 5.14+, the
++        default) also maps them into this process, so ``gather`` takes no minor fault per row (GB10, 48 rows: 0.131 ms
++        after WILLNEED, 0.015 ms after POPULATE_READ); it blocks this (background) thread until read.
++        TF_NGRAM_POPULATE=0, or a kernel that refuses it: MADV_WILLNEED (asynchronous, page cache only)."""
+ 
+         flat = np.unique(np.asarray(ids, dtype=np.int64).reshape(-1))
+         flat = flat[(flat >= 0) & (flat < self.rows)]
+@@ -223,13 +231,16 @@ class NgramTable(_Residency):
+         shard = np.searchsorted(self.starts, flat, side="right") - 1
+         at = self.offsets[shard] + (flat - self.starts[shard]) * self.row_bytes
+         where, page, libc, n = self.fidx[shard], mmap.PAGESIZE, _libc(), 0
++        global _ADVICE
+         for f in np.unique(where):
+             sel = at[where == f]
+             pages = np.unique(np.concatenate([sel // page, (sel + self.row_bytes - 1) // page]))
+             breaks = np.nonzero(np.diff(pages) != 1)[0] + 1              # runs of consecutive pages, one call each
+             base = self.maps[f].ctypes.data
+             for run in np.split(pages, breaks):
+-                libc.madvise(base + int(run[0]) * page, len(run) * page, mmap.MADV_WILLNEED)
++                if libc.madvise(base + int(run[0]) * page, len(run) * page, _ADVICE) != 0 and _ADVICE != WILLNEED:
++                    _ADVICE = WILLNEED                                   # an older kernel: page cache reads only
++                    libc.madvise(base + int(run[0]) * page, len(run) * page, WILLNEED)
+             n += len(pages)
+         return n
+ 
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/multi_solo.py b/src/tensorfold/families/qwen4_exp/cuda/multi_solo.py
+index 23d3b4a3..08ef4b00 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/multi_solo.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/multi_solo.py
+@@ -2,7 +2,6 @@
+ 
+ from __future__ import annotations
+ 
+-import os
+ import time
+ 
+ import torch
+@@ -18,11 +17,6 @@ from .forward import commit
+ from .roundprof import PROFILE
+ from .state import Buffers
+ 
+-# TF_ABSORB_FIRST (default on): a lone stream's MTP absorb launches before the verify's commit, so commit's host work
+-# (a DeltaNet replay launch per layer when a draft was rejected) runs while the absorb step is on the GPU. The same
+-# kernels on the same data in another order: the absorb neither reads nor writes what commit does. =0: commit first.
+-ABSORB_FIRST = os.environ.get("TF_ABSORB_FIRST", "1").strip().lower() not in ("0", "off", "false", "no")
+-
+ 
+ def solo(w, st, capacity, depth, pbuf, timing=None):
+     from .graphs import Graphs
+@@ -234,36 +228,24 @@ class Alone:
+                     [st.pos + 1 + r for r in path], s.probabilities, rows=path)
+         if prof is not None:
+             prof.mark("sample+accept*")
+-        keep = len(path)
++        commit(self.w, st, e.buf, R, len(path))
++        if prof is not None:
++            prof.mark("commit*")
++        s.committed.extend(tokens[:len(path)])
++        s.counted(R)
+         new = [tokens[r] for r in path[1:]] + [end]
+         last = len(s.out) + len(new) >= s.count or end in self._ends(s)
+-        room = min(self.depth, s.count - len(s.out) - keep)
++        s.drafts = []
++        room = min(self.depth, s.count - len(s.out) - len(path))
+         # D4: the next window's n-gram pages are asked for row by row while the draft chain runs (residency only)
+         ahead = decode_ahead.rows(self.w) if not last and getattr(self.w, "comm", None) is None else None
+-
+-        def kept() -> None:
+-            """Commit the kept rows, then ask for the next window's n-gram pages (they read the new history)."""
+-
+-            commit(self.w, st, e.buf, R, keep)
+-            if prof is not None:
+-                prof.mark("commit*")
+-            decode_ahead.start(ahead, [(0, st, end)])
+-
+-        s.committed.extend(tokens[:keep])
+-        s.counted(R)
+-        s.drafts = []
+-        drafting = not last and room > 0
+-        first = drafting and ABSORB_FIRST
+-        if not first:
+-            kept()
+-        if drafting:
++        decode_ahead.start(ahead, [(0, st, end)])
++        if not last and room > 0:
+             more = {"cost": self.cost} if self.cost > 0 else {}
+             if ahead is not None:
+                 more["ahead"] = ahead
+-            if first:      # the MTP absorb reads none of what commit writes (its own cache, length and buffers)
+-                more["after_absorb"] = kept
+-            s.drafts = draft(e, e.buf.streams[:keep], rows[:keep], st.pos + 1 + (keep if first else 0), room,
+-                             s.sampling, self.confidence, **more)
++            s.drafts = draft(e, e.buf.streams[:len(path)], rows[:len(path)], st.pos + 1, room, s.sampling,
++                             self.confidence, **more)
+         elif ahead is not None:
+             ahead.send()
+         s.take(new, self._ends(s))
+-- 
+2.43.0
+

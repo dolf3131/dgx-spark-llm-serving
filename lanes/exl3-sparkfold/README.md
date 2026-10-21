@@ -1,7 +1,7 @@
 # Qwen3.8-Flash-Next on one DGX Spark: EXL3 4.05 bpw on TensorFold / SparkFold
 
-What one Spark serves here since 2026-10-09 (this build since 2026-10-16): turboderp's EXL3 4.05 bpw pack of Qwen3.8-Flash-Next on the
-TensorFold 0.6.5 Python engine, with [SparkFold](https://github.com/grearjake-star/TensorFold)'s GB10 work merged in and nine patches of
+What one Spark serves here since 2026-10-09 (this build since 2026-10-21): turboderp's EXL3 4.05 bpw pack of Qwen3.8-Flash-Next on the
+TensorFold 0.6.5 Python engine, with [SparkFold](https://github.com/grearjake-star/TensorFold)'s GB10 work merged in and eighteen patches of
 ours on top. Five concurrent streams of 262,144 tokens each, image input, MTP drafting, replies equal to plain decoding.
 
 The engine is a snapshot: TensorFold froze its Python engine (see [Newer upstream work](#newer-upstream-work)), so this lane is pinned
@@ -14,12 +14,12 @@ to a commit and does not follow a release line. Measurements are dated; read [Li
 | Hardware | 1x DGX Spark (GB10, 121 GiB unified memory) |
 | Checkpoint | [`turboderp/Qwen3.8-Flash-Next-exl3`](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3), branch `4.05bpw_h6_ng6`, 99.94 GiB: trunk 62.9 GiB (on the GPU), consolidated n-gram table 36.36 GiB (memory-mapped), vision sidecar 0.52 GiB, MTP head included |
 | Per decoded token | 5.28 GB read (by header arithmetic), against 7.09 GB for an NVFP4 QAD build we served before (a different checkpoint from the one the vLLM lane uses) |
-| Engine | TensorFold 0.6.5 (Python) + SparkFold `806b345` + [9 patches](patches/), source mounted over the image `tensorfold-qwen38:v0.3.6.3` |
+| Engine | TensorFold 0.6.5 (Python) + SparkFold `806b345` + [18 patches](patches/), source mounted over the image `tensorfold-qwen38:v0.3.6.3` with `xgrammar` added |
 | Serving | `--parallel 5 --context 262144 --kv-dtype int8 --mtp-drafts 6 --mtp-confidence 0.60 --thinking --vision`, memory floor 6 GiB, NVMe spill on, MTP draft list with Hangul tokens |
-| Decode | single stream, 600-token windows (2026-10-16): English 59, Korean 49 tok/s on average over the bench prompts (Korean was about 42 before the Hangul draft list); 128-token windows on short prompts: median 71 tok/s |
+| Decode | single stream, 600-token replies (2026-10-21): English 62.9 tok/s on average over the four bench prompts (59.3 on 2026-10-16, same replies), Korean 54.1 (three prompts, sampled with a fixed seed; 49 on 2026-10-16 with unseeded sampling); sgbench end to end (thinking on, time to first token included): 66.9 / 92.1 / 131.1 tok/s at 1 / 2 / 4 streams |
 | Cold prefill | 1.8-2.1k tok/s from 1.9k to 49k prompt tokens (real English/Korean text) |
 | Resuming a 100k-token conversation after an eviction | 40-50 s from scratch, 0.8-2.3 s from NVMe (controlled replay) |
-| Cold start | about 90 s once the extensions are built; the first start compiles three extensions (about three minutes) |
+| Cold start | 70-90 s once the extensions are built; the first start compiles them (several minutes) |
 
 Quality: the pack's card reports a KLD of 0.0067 against BF16 at 4.05 bpw (turboderp's measurement on an English-leaning trace). We have not
 measured quality ourselves.
@@ -28,7 +28,7 @@ measured quality ourselves.
 
 | | |
 |---|---|
-| [patches/](patches/) | the 9 patches, `apply.sh` to build the tree, licence and authorship notes |
+| [patches/](patches/) | the 18 patches, `apply.sh` to build the tree, licence and authorship notes |
 | [scripts/start.sh](scripts/start.sh) | the `docker run` for this lane, with profiles and knobs |
 | [docs/](docs/) | [the memory gate](docs/memory-gate.md), [NVMe spill](docs/nvme-spill.md), [quoted special tokens](docs/quoted-special-tokens.md) |
 | [results/](results/) | dated measurements |
@@ -48,8 +48,10 @@ measured quality ourselves.
    and run its `scripts/prepare.sh`: step 2 builds (or pulls) `tensorfold-qwen38:v0.3.6.3`, TensorFold v0.3.6.3 plus their patches on NVIDIA's
    PyTorch 26.07 container. Steps 3 and 4 of that script fetch that wrapper's own MLX checkpoint, which this lane does not use. The image only
    supplies PyTorch and the dependencies: the TensorFold source mounted in step 4 replaces the code inside it. Ours carries the label
-   `tf.patches=c1f5d72f8d16`.
-4. **The patched tree.** `patches/apply.sh ~/tensorfold-src` (SparkFold at `806b345` plus the nine patches).
+   `tf.patches=c1f5d72f8d16`. Then add `xgrammar` (structured output, `response_format`):
+   `docker build -t tensorfold-qwen38:v0.3.6.3-xgrammar scripts/xgrammar` ([Dockerfile](scripts/xgrammar/Dockerfile); `start.sh` uses that
+   image by default, `IMAGE=tensorfold-qwen38:v0.3.6.3` runs without it).
+4. **The patched tree.** `patches/apply.sh ~/tensorfold-src` (SparkFold at `806b345` plus the eighteen patches).
 5. **Vision (optional).** Convert the pack's `vision_k6.safetensors` once with `python -m tensorfold.vision.exl3_convert` (run it in the image with
    `PYTHONPATH` at the tree; see the module's `--help` for its arguments) and keep the result as `$CACHE/vision-f16-v3.safetensors`
    (898 MB). Or start with `VISION=0`. We ran this conversion once, on 2026-10-09.
@@ -77,7 +79,9 @@ shared box needs and what you must not do on an untrusted network.
 | `TF_DRAFT_VOCAB` | `draft_vocab_ko.txt` | MTP draft list with the 6,641 Hangul tokens the stock list lacks (patch 0009); speed only. Set by `start.sh` outside the profiles, `DRAFT_VOCAB=` turns it off |
 
 Left at the tree's defaults: `TF_DRAFT_COST` 0.06, `TF_MULTI_GRAPHS`, fused routing, stage batch, decode and n-gram read-ahead; `TF_NGRAM_LOCK`
-unset; `TF_EXL3_HC_FP8` off (it changes output bits). `PROFILE=safe` pins the draft cost and shared-round graphs back to the old policy.
+unset; `TF_EXL3_HC_FP8` off (it changes output bits). Patches 0010-0018 are on by default and each has an off switch that restores the earlier
+path: `TF_F16_TILE=0` (hyper-connection tile), `TF_EMIT_EARLY=0`, `TF_NGRAM_GATHER_THREADS=0` (byte-wise n-gram gather), `TF_MOE_SPLIT=0`
+(MoE block as before); `TF_ROUND_PROFILE=1` prints host timings of each round. None of them changes output bits. `PROFILE=safe` pins the draft cost and shared-round graphs back to the old policy.
 
 ## Measurements
 
@@ -92,6 +96,11 @@ unset; `TF_EXL3_HC_FP8` off (it changes output bits). `PROFILE=safe` pins the dr
 | Tool calling, tool-eval-bench (97 scenarios) | 90/100 merged (88 for the full run, structured output fixed by installing `xgrammar`); 3 safety-critical failures | [results/2026-10-14 tool-eval](results/2026-10-14-tool-eval.md) |
 | Hangul draft list (patch 0009) | Korean draft acceptance 0.32-0.49 to 0.51-0.61, Korean decode about 42 to 49 tok/s; English greedy replies byte-identical | [results/2026-10-16](results/2026-10-16-ko-draft-vocab-and-decode-profile.md) |
 | Decode round, nsys | median 39.7 ms: main verify graph 34.3 (85%), drafts 2.6, idle gaps 2.4; large kernels at ~77-91% of sustained bandwidth, no single waste | same |
+| Patches 0010-0018 (decode kernels, n-gram gather, MoE block) | English greedy 62.1 / 63.9 / 50.9 / 60.3 to 65.9 / 67.8 / 53.9 / 63.9 tok/s (+6%), same replies; 0017 +2.0% and 0018 +1.75% in back-to-back A/Bs of 14 identical replies; first turns of 3-4.5k tokens -15% (0016) | [results/2026-10-21](results/2026-10-21-decode-kernels-and-bench-suite.md) |
+| Bandwidth ceiling, corrected | about 250-255 GB/s for decode-sized reads (2026-10-16 used 238, measured on small tensors); a bit-exact `cp.async`/TMA streaming kernel was slower, the loss was the activation loads | same |
+| sgbench, 5 workloads x 2 runs, end to end (2026-10-21) | 66.9 / 92.1 / 131.1 tok/s token-weighted at 1 / 2 / 4 streams (65.9 / 88.1 / 127.9 on 2026-10-14) | [results/2026-10-21](results/2026-10-21-decode-kernels-and-bench-suite.md) |
+| Tool calling, tool-eval-bench, one full run with `xgrammar` (2026-10-21) | 90/100, 175/194 points, deployability 81; the same 3 safety-critical failures | same |
+| llama-benchy by depth and streams (2026-10-21) | decode 61.7 / 89.5 / 112.2 tok/s at depth 0 and 1 / 2 / 4 streams (53.9 / 82.0 / 99.5 on 2026-10-14); prefill 1.7-2.0k tok/s | same |
 
 Cold prefill here is not faster than the 2,719 tok/s at 30k tokens that the vLLM NVFP4 lane in this repository measured with its own script.
 The two were not measured with the same script or on the same checkpoint, so do not subtract them.
@@ -109,6 +118,9 @@ The two were not measured with the same script or on the same checkpoint, so do 
 - **Other jobs move the numbers.** The CPU and GPU share one memory, and a CPU-heavy job next to the server overlapped the last rows of the
   2026-10-14 perf run. An earlier run that afternoon, on the container before `xgrammar` was added, had five of six deeper rows at 964-1,358 tok/s
   against 1,724-1,903 on the idle rerun; we did not record what else was running then and have not found the cause. Run benchmarks on an idle machine.
+- **Graph warm-up after a restart.** A lone stream decodes on CUDA graphs captured per slot; startup captures the main graph slot only, so the
+  first reply that decodes in another slot (a conversation resumed from a kept state, or the first single request after several streams) pays
+  about 0.6-1.6 s of captures once. Same reply, slower: in the 2026-10-21 sgbench this took a 69-token answer from 1.1 to 1.8 s.
 - **A restart deletes the server's log.** `start.sh` removes the old container; save `docker logs` first if you want the evidence.
 - **Not measured:** quality of this pack on Korean or on long tool contexts, long-context decode against other engines, any other GB10.
 

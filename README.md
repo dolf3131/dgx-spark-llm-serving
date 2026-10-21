@@ -8,7 +8,7 @@ are redirected by GitHub, and the paths of the existing lanes did not change.
 
 | Model | Lane | Engine | Checkpoint | Status |
 |---|---|---|---|---|
-| Qwen3.8-Flash-Next (125B total, 6B active) | [`lanes/exl3-sparkfold`](lanes/exl3-sparkfold/README.md) | TensorFold 0.6.5 (Python) + SparkFold + 9 patches | turboderp's EXL3 4.05 bpw pack, 99.94 GiB | **served since 2026-10-09**, this build since 2026-10-16 |
+| Qwen3.8-Flash-Next (125B total, 6B active) | [`lanes/exl3-sparkfold`](lanes/exl3-sparkfold/README.md) | TensorFold 0.6.5 (Python) + SparkFold + 18 patches | turboderp's EXL3 4.05 bpw pack, 99.94 GiB | **served since 2026-10-09**, this build since 2026-10-21 |
 | Qwen3.8-Flash-Next | [`lanes/vllm-nvfp4`](lanes/vllm-nvfp4/README.md) | vLLM, an image carrying unmerged PRs, plus two local patches | NVIDIA's NVFP4, 123.6 GiB, n-gram table paged to SSD swap | snapshot of 2026-09-06, **not served now**, left as written |
 | Nemotron 3.5 Super VL (120B total, 12B active) | [`lanes/nemotron35-super-vl-vllm`](lanes/nemotron35-super-vl-vllm/README.md) | vLLM nightly `3f1bcfd`, NVIDIA's DGX Spark recipe | NVIDIA's NVFP4 (~75 GB) + the LiLiCorr drafter (1.3 GB) | **prepared 2026-10-16, not booted yet**: no measurements |
 

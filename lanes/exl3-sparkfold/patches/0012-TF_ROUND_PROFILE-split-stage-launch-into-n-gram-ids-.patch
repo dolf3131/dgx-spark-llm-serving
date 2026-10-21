@@ -1,0 +1,74 @@
+From ba2c7be3b32845e2b723073fe4e785fc7fd50967 Mon Sep 17 00:00:00 2001
+From: dolf3131 <144650661+dolf3131@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 18:31:48 +0900
+Subject: [PATCH] TF_ROUND_PROFILE: split stage+launch into n-gram ids,
+ pinned-buffer wait, n-gram rows and the graph launch
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/tensorfold/families/qwen4_exp/cuda/forward.py   | 7 +++++++
+ src/tensorfold/families/qwen4_exp/cuda/graphs.py    | 1 +
+ src/tensorfold/families/qwen4_exp/cuda/roundprof.py | 2 +-
+ 3 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/forward.py b/src/tensorfold/families/qwen4_exp/cuda/forward.py
+index 0df86f5f..7ac5fe19 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/forward.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/forward.py
+@@ -15,6 +15,7 @@ from tensorfold.cuda import moe as moe_mod
+ from tensorfold.cuda.kernels import gdn as shared_gdn
+ 
+ from . import attention as attn_mod
++from .roundprof import PROFILE
+ from . import gdn as gdn_mod
+ from . import attn_multi, gdn_io, gdn_multi, glue, nvfp4_moe, qmm
+ from . import image_rows
+@@ -457,7 +458,11 @@ def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]
+                 lookups.extend(per)
+     # the table reads before the wait, which ends once the GPU has run the previous step: their faults overlap it
+     ahead = [p.table.gather(ids) for p, ids, _ in lookups] if w.x3 is None and stage_ahead() else None
++    if PROFILE is not None:
++        PROFILE.mark("stage ids*")
+     b.staged.synchronize()               # the previous step's copies out of the pinned buffers are done
++    if PROFILE is not None:
++        PROFILE.mark("stage wait*")
+     b.ids_host[:R].numpy()[:] = np.asarray([t for _, tokens in windows for t in tokens], dtype=np.int32)
+     b.ids[:R].copy_(b.ids_host[:R], non_blocking=True)
+     for i, (p, ids, at) in enumerate(lookups):
+@@ -468,6 +473,8 @@ def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]
+         else:
+             stage_ple_rows(p, b, ids, at=at, got=None if ahead is None else ahead[i])
+     b.staged.record()
++    if PROFILE is not None:
++        PROFILE.mark("stage rows*")
+     return segs
+ 
+ 
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/graphs.py b/src/tensorfold/families/qwen4_exp/cuda/graphs.py
+index b781a51b..e356c14b 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/graphs.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/graphs.py
+@@ -66,6 +66,7 @@ class Graphs:
+         evt = getattr(self, "main_evt", None)            # tests build Graphs without __init__
+         if evt is not None:
+             evt.record()
++            PROFILE.mark("graph launch*")
+         return b.logits[:R]
+ 
+     @torch.no_grad()
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/roundprof.py b/src/tensorfold/families/qwen4_exp/cuda/roundprof.py
+index acaad104..5f9e602d 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/roundprof.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/roundprof.py
+@@ -12,7 +12,7 @@ ON = os.environ.get("TF_ROUND_PROFILE", "").strip() == "1"
+ EVERY = int(os.environ.get("TF_ROUND_PROFILE_EVERY", "400") or 400)
+ 
+ # phases, in round order (host stretches marked *, the GPU idles through them)
+-PHASES = ("loop*", "stage+launch*", "main gpu", "sample+accept*", "commit*", "absorb launch*", "absorb gpu",
++PHASES = ("loop*", "stage ids*", "stage wait*", "stage rows*", "graph launch*", "stage+launch*", "main gpu", "sample+accept*", "commit*", "absorb launch*", "absorb gpu",
+           "draft pick+launch*", "draft gpu", "last pick*", "tail*")
+ 
+ 
+-- 
+2.43.0
+

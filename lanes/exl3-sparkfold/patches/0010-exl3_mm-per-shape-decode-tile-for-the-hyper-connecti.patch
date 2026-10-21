@@ -1,0 +1,124 @@
+From fa9d19c530a2dd8095224147666ad47b39bfe044 Mon Sep 17 00:00:00 2001
+From: dolf3131 <144650661+dolf3131@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 17:55:15 +0900
+Subject: [PATCH] exl3_mm: per-shape decode tile for the hyper-connection fp16
+ faces (same bits, ~0.19 ms a round on GB10)
+
+Only BN, the K step inside a slice, warps and stages change; the K slices and their order are DECODE_TILE's, so
+partial slices and summed rows are bit-identical (tests/cuda/test_flashnext_f16_tile.py, rows 1-16). Measured in
+one graph of the 96 decoder faces: up 28.3 -> 26.9 us, down 29.5 -> 29.0 us per call (rows 1-8); the read-only
+ceiling for a 6.6 MB face is 27.2 us. TF_F16_TILE=0 restores DECODE_TILE.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../families/qwen4_exp/cuda/exl3_mm.py        | 26 +++++++++-
+ tests/cuda/test_flashnext_f16_tile.py         | 52 +++++++++++++++++++
+ 2 files changed, 76 insertions(+), 2 deletions(-)
+ create mode 100644 tests/cuda/test_flashnext_f16_tile.py
+
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/exl3_mm.py b/src/tensorfold/families/qwen4_exp/cuda/exl3_mm.py
+index 1c2ead65..e679958b 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/exl3_mm.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/exl3_mm.py
+@@ -150,6 +150,27 @@ def f16_split(n: int, k: int, target: int = 96) -> int:
+     return sk
+ 
+ 
++DECODE_TILE = (64, 64, 4, 3)            # BN, BK, warps, stages of a decode window's split fp16 matmul
++
++
++def decode_tile(n: int, k: int, sk: int) -> tuple[int, int, int, int]:
++    """The decode launch for an (n, k) fp16 matrix with sk K slices. Only the tile width, the K step inside a slice,
++    warps and stages vary, never the slices or the K order, so every shape keeps the bits of DECODE_TILE (checked in
++    tests/cuda/test_flashnext_f16_tile.py). The hyper-connection faces take the faster measured launch (GB10, 96
++    faces in one graph, rows 1-8: up 28.3 -> 26.9 us, down 29.5 -> 29.0 us); ``TF_F16_TILE=0`` keeps DECODE_TILE."""
++
++    import os
++
++    if os.environ.get("TF_F16_TILE", "").strip() == "0":
++        return DECODE_TILE
++    ks = k // sk
++    if sk == 1 and k == 320 and n % 16 == 0:             # hyper-connection up faces [S*D, low]
++        return (16, 64, 2, 6)
++    if sk > 1 and ks % 128 == 0 and n <= 384:            # hyper-connection down faces [low | inject, S*D]
++        return (64, 128, 4, 2)
++    return DECODE_TILE
++
++
+ @dataclass
+ class F16:
+     """y = x @ w.T for a matrix the pack leaves unquantized (fp16): fixed tiles and K slices, so a row is its own."""
+@@ -177,9 +198,10 @@ class F16:
+         m = x.shape[0]
+         if x.stride(1) != 1 or x.shape[1] != self.k:
+             raise ValueError(f"F16: x {tuple(x.shape)} does not match K={self.k}")
+-        grid = (triton.cdiv(m, 16), triton.cdiv(self.n, 64), self.sk)
++        bn, bk, warps, stages = decode_tile(self.n, self.k, self.sk)
++        grid = (triton.cdiv(m, 16), triton.cdiv(self.n, bn), self.sk)
+         _f16_mm[grid](x, self.w, out, m, self.n, x.stride(0), self.n if f32 else out.stride(0),
+-                      K=self.k, KS=self.k // self.sk, BM=16, BN=64, BK=64, F32=f32, num_warps=4, num_stages=3)
++                      K=self.k, KS=self.k // self.sk, BM=16, BN=bn, BK=bk, F32=f32, num_warps=warps, num_stages=stages)
+ 
+     def __call__(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+         if out.stride(-1) != 1:
+diff --git a/tests/cuda/test_flashnext_f16_tile.py b/tests/cuda/test_flashnext_f16_tile.py
+new file mode 100644
+index 00000000..4fbab859
+--- /dev/null
++++ b/tests/cuda/test_flashnext_f16_tile.py
+@@ -0,0 +1,52 @@
++"""Guards for exl3_mm.decode_tile: the per-shape decode launches of the pack's fp16 matrices keep DECODE_TILE's bits
++(only the tile width, the K step inside a slice, warps and stages change, never the K slices or their order), for the
++partial slices the hyper-connection activation sums and for summed outputs, at every decode row count."""
++
++import pytest
++import torch
++
++from tensorfold.families.qwen4_exp.cuda import exl3_mm
++
++cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA")
++
++# (n, k): hyper-connection up, down with inject, the final mixer's down, the GDN b/a pair
++SHAPES = [(10240, 320), (324, 10240), (320, 10240), (96, 2560)]
++
++
++def test_tile_choice_keeps_the_slices():
++    for n, k in SHAPES:
++        sk = exl3_mm.f16_split(n, k)
++        bn, bk, warps, stages = exl3_mm.decode_tile(n, k, sk)
++        assert (k // sk) % bk == 0
++        assert bn in (16, 32, 64, 128)
++    assert exl3_mm.decode_tile(10240, 320, 1) == (16, 64, 2, 6)
++    assert exl3_mm.decode_tile(324, 10240, 16) == (64, 128, 4, 2)
++    assert exl3_mm.decode_tile(96, 2560, 8) == exl3_mm.DECODE_TILE      # K slice 320 is not a multiple of 128
++
++
++def test_env_off(monkeypatch):
++    monkeypatch.setenv("TF_F16_TILE", "0")
++    assert exl3_mm.decode_tile(10240, 320, 1) == exl3_mm.DECODE_TILE
++
++
++@cuda
++@pytest.mark.parametrize("n,k", SHAPES)
++def test_bits_match_the_deployed_tile(n, k, monkeypatch):
++    g = torch.Generator(device="cuda").manual_seed(n + k)
++    w = (torch.randn((n, k), generator=g, device="cuda") * 0.03).half()
++    sc = exl3_mm.Scratch(11)
++    face = exl3_mm.F16(w, n, k, exl3_mm.f16_split(n, k), sc)
++    sc.part = torch.empty((face.sk * n * exl3_mm.ROWS,), dtype=torch.float32, device="cuda")
++    for rows in (1, 2, 3, 4, 5, 8, 13, 16):
++        x = (torch.randn((rows, k), generator=g, device="cuda") * 2).to(torch.bfloat16)
++        monkeypatch.setenv("TF_F16_TILE", "0")
++        ref_part = face.partials(x).clone()
++        ref = face(x, torch.empty((rows, n), dtype=torch.bfloat16, device="cuda")).clone()
++        monkeypatch.delenv("TF_F16_TILE")
++        got_part = face.partials(x).clone()
++        got = face(x, torch.empty((rows, n), dtype=torch.bfloat16, device="cuda"))
++        assert torch.equal(got_part.view(torch.int32), ref_part.view(torch.int32)), (n, k, rows)
++        assert torch.equal(got.view(torch.int16), ref.view(torch.int16)), (n, k, rows)
++        # a row is its own: row 0 alone gives row 0 of the window
++        one = face(x[:1], torch.empty((1, n), dtype=torch.bfloat16, device="cuda"))
++        assert torch.equal(one.view(torch.int16), got[:1].view(torch.int16))
+-- 
+2.43.0
+

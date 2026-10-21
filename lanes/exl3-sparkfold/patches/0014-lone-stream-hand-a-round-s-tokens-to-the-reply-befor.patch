@@ -1,0 +1,66 @@
+From f40957884133dac6b5a9465d3f302c5e8696354d Mon Sep 17 00:00:00 2001
+From: dolf3131 <144650661+dolf3131@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 18:50:50 +0900
+Subject: [PATCH] lone stream: hand a round's tokens to the reply before its
+ draft chain (TF_EMIT_EARLY, default on)
+
+A streamed reply's chunk work runs on the HTTP thread and takes the GIL as soon as tokens arrive. Emitted after the
+draft chain it met the next round's host staging: on the real lane (2026-10-17) the n-gram row staging took
+0.33-0.49 ms a round streamed vs 0.15-0.21 ms with stream=false (same tokens). Emitted before the chain, it overlaps
+the chain's GPU waits (torch drops the GIL there). Same tokens and chunk boundaries; a stop string found in that emit
+skips the round's drafts. tests/cuda L7/decode_ahead/multi/D: the same results with =1 and =0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../families/qwen4_exp/cuda/multi_solo.py          | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/multi_solo.py b/src/tensorfold/families/qwen4_exp/cuda/multi_solo.py
+index 08ef4b00..6b512e8a 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/multi_solo.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/multi_solo.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import time
+ 
+ import torch
+@@ -17,6 +18,13 @@ from .forward import commit
+ from .roundprof import PROFILE
+ from .state import Buffers
+ 
++# TF_EMIT_EARLY (default on): a lone round hands its tokens to the reply (Stream.take) before its draft chain, not
++# after it. A streamed reply's chunk work (detokenizing, the stop check, SSE) runs on the HTTP thread and takes the GIL
++# as soon as tokens arrive; after the chain it met the next round's host staging (n-gram rows 0.33-0.49 ms a round
++# streamed vs 0.15-0.21 ms unstreamed on GB10), before it, it overlaps the chain's GPU waits. Same tokens and chunks;
++# a stop string found there skips that round's drafts. =0: after the chain.
++EMIT_EARLY = os.environ.get("TF_EMIT_EARLY", "1").strip().lower() not in ("0", "off", "false", "no")
++
+ 
+ def solo(w, st, capacity, depth, pbuf, timing=None):
+     from .graphs import Graphs
+@@ -237,6 +245,9 @@ class Alone:
+         last = len(s.out) + len(new) >= s.count or end in self._ends(s)
+         s.drafts = []
+         room = min(self.depth, s.count - len(s.out) - len(path))
++        if EMIT_EARLY:
++            s.take(new, self._ends(s))
++            last = last or s.done                    # a stop string ended it: no chain to draft
+         # D4: the next window's n-gram pages are asked for row by row while the draft chain runs (residency only)
+         ahead = decode_ahead.rows(self.w) if not last and getattr(self.w, "comm", None) is None else None
+         decode_ahead.start(ahead, [(0, st, end)])
+@@ -248,7 +259,8 @@ class Alone:
+                              self.confidence, **more)
+         elif ahead is not None:
+             ahead.send()
+-        s.take(new, self._ends(s))
++        if not EMIT_EARLY:
++            s.take(new, self._ends(s))
+         self._timed(time.perf_counter() - t0, 0)    # a prompt arriving next sizes its passes by this round's time
+         if prof is not None:
+             prof.end(len(s.drafts))
+-- 
+2.43.0
+

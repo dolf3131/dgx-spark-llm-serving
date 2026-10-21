@@ -1,0 +1,80 @@
+From 9dda0999bf40d4c09208135e8961e9a01d7f0612 Mon Sep 17 00:00:00 2001
+From: dolf3131 <144650661+dolf3131@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 19:02:53 +0900
+Subject: [PATCH] revert the MADV_POPULATE_READ read-ahead: no measured change
+ on the real lane
+
+Boot C vs B (2026-10-17): stage's n-gram row time stayed 0.33-0.50 ms a round; the locked ~25 GiB of the table is
+already mapped, and most of that stretch was GIL contention with the HTTP thread (fixed by TF_EMIT_EARLY).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../families/qwen4_exp/cuda/decode_ahead.py       |  5 ++---
+ .../families/qwen4_exp/cuda/exl3_pack.py          | 15 ++-------------
+ 2 files changed, 4 insertions(+), 16 deletions(-)
+
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/decode_ahead.py b/src/tensorfold/families/qwen4_exp/cuda/decode_ahead.py
+index 0a4dc7e7..294204cc 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/decode_ahead.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/decode_ahead.py
+@@ -5,9 +5,8 @@ queued on the GPU between the last draft pick and the next verify launch. A row
+ of the table (and not in the page cache) costs a major fault there, ~0.44 ms with the GIL held (C2). A window's rows
+ are known one at a time well before ``stage``: row 0 (the round's end token) once verify's sampling has run, and each
+ draft once its pick is read back, while the next MTP step still runs. Here each row's table ids go to a background
+-thread as soon as the row is known, and it asks the kernel for their pages through ctypes (the GIL is released):
+-MADV_POPULATE_READ by default, which also maps them into the process so ``stage``'s gather takes no minor fault per row,
+-or MADV_WILLNEED (TF_NGRAM_POPULATE=0: asynchronous, page cache only; see NgramTable.willneed). Residency only: ``stage`` and
++thread as soon as the row is known, and it asks the kernel for their pages (MADV_WILLNEED through ctypes: the GIL is
++released and the reads run asynchronously), so ``stage``'s gather finds them read. Residency only: ``stage`` and
+ every value it gathers are unchanged, and nothing here touches the GPU. TF_DECODE_AHEAD=0: nothing is asked for.
+ """
+ 
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/exl3_pack.py b/src/tensorfold/families/qwen4_exp/cuda/exl3_pack.py
+index 580af6aa..76b2cd7e 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/exl3_pack.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/exl3_pack.py
+@@ -124,11 +124,6 @@ class Pack:
+         return torch.from_numpy(fmt.unpack_signs(self.get(f"{prefix}.{packed}").numpy()))
+ 
+ 
+-WILLNEED, POPULATE_READ = mmap.MADV_WILLNEED, 22          # MADV_POPULATE_READ (Linux 5.14)
+-_ADVICE = WILLNEED if os.environ.get("TF_NGRAM_POPULATE", "1").strip().lower() in ("0", "off", "false", "no") \
+-    else POPULATE_READ
+-
+-
+ @functools.lru_cache(maxsize=1)
+ def _libc():
+     import ctypes
+@@ -219,10 +214,7 @@ class NgramTable(_Residency):
+         return out.view(np.int16)
+ 
+     def willneed(self, ids: np.ndarray) -> int:
+-        """Ask the kernel to read rows ``ids``' pages ahead; ctypes drops the GIL. MADV_POPULATE_READ (Linux 5.14+, the
+-        default) also maps them into this process, so ``gather`` takes no minor fault per row (GB10, 48 rows: 0.131 ms
+-        after WILLNEED, 0.015 ms after POPULATE_READ); it blocks this (background) thread until read.
+-        TF_NGRAM_POPULATE=0, or a kernel that refuses it: MADV_WILLNEED (asynchronous, page cache only)."""
++        """Ask the kernel to read rows ``ids``' pages ahead (MADV_WILLNEED, asynchronous; ctypes drops the GIL)."""
+ 
+         flat = np.unique(np.asarray(ids, dtype=np.int64).reshape(-1))
+         flat = flat[(flat >= 0) & (flat < self.rows)]
+@@ -231,16 +223,13 @@ class NgramTable(_Residency):
+         shard = np.searchsorted(self.starts, flat, side="right") - 1
+         at = self.offsets[shard] + (flat - self.starts[shard]) * self.row_bytes
+         where, page, libc, n = self.fidx[shard], mmap.PAGESIZE, _libc(), 0
+-        global _ADVICE
+         for f in np.unique(where):
+             sel = at[where == f]
+             pages = np.unique(np.concatenate([sel // page, (sel + self.row_bytes - 1) // page]))
+             breaks = np.nonzero(np.diff(pages) != 1)[0] + 1              # runs of consecutive pages, one call each
+             base = self.maps[f].ctypes.data
+             for run in np.split(pages, breaks):
+-                if libc.madvise(base + int(run[0]) * page, len(run) * page, _ADVICE) != 0 and _ADVICE != WILLNEED:
+-                    _ADVICE = WILLNEED                                   # an older kernel: page cache reads only
+-                    libc.madvise(base + int(run[0]) * page, len(run) * page, WILLNEED)
++                libc.madvise(base + int(run[0]) * page, len(run) * page, mmap.MADV_WILLNEED)
+             n += len(pages)
+         return n
+ 
+-- 
+2.43.0
+

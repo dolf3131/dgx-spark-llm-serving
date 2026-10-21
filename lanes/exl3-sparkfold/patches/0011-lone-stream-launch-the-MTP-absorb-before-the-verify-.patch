@@ -1,0 +1,295 @@
+From df88c948426a5741262ca04e021c4c3c5eeff36a Mon Sep 17 00:00:00 2001
+From: dolf3131 <144650661+dolf3131@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 18:19:35 +0900
+Subject: [PATCH] lone stream: launch the MTP absorb before the verify's commit
+ (TF_ABSORB_FIRST, default on) + TF_ROUND_PROFILE
+
+The absorb reads none of what commit writes (its own cache, length, position and buffers; commit writes the
+DeltaNet states, conv windows, n-gram history and pos), so commit's host work (a replay launch per DeltaNet layer
+when a draft is rejected) now runs while the absorb is on the GPU; decode_ahead.start still follows commit (it
+reads the new n-gram history). Same kernels on the same data on one stream: tests/cuda/test_flashnext_L7.py and
+test_flashnext_decode_ahead_cuda.py give the same results with TF_ABSORB_FIRST=1 and =0 (and as TF-tc).
+
+TF_ROUND_PROFILE=1 prints, every TF_ROUND_PROFILE_EVERY lone rounds, the host ms per round between fixed marks
+(events after each replay), so the stretches the GPU waits for the host can be split. Off by default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../families/qwen4_exp/cuda/decode.py         | 19 +++++-
+ .../families/qwen4_exp/cuda/graphs.py         |  9 +++
+ .../families/qwen4_exp/cuda/multi_solo.py     | 50 ++++++++++++---
+ .../families/qwen4_exp/cuda/roundprof.py      | 64 +++++++++++++++++++
+ 4 files changed, 131 insertions(+), 11 deletions(-)
+ create mode 100644 src/tensorfold/families/qwen4_exp/cuda/roundprof.py
+
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/decode.py b/src/tensorfold/families/qwen4_exp/cuda/decode.py
+index 1f50a95b..edca032b 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/decode.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/decode.py
+@@ -17,6 +17,7 @@ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
+ 
+ from . import CONFIDENCE, DEPTH
+ from .draft_cost import DRAFT_MS, VERIFY_MS, cost_bars, timing_table  # noqa: F401 (decode.* names)
++from .roundprof import PROFILE
+ from .forward import Cut, commit, cut_snapshot, forward
+ from . import image_rows
+ from .state import CAND, Buffers, State
+@@ -266,17 +267,24 @@ def absorb(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int]) -> torc
+ 
+ 
+ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position: int, count: int,
+-          sampling: Sampling | None, confidence: float = 0.0, cost: float = 0.0, ahead=None) -> list[int]:
++          sampling: Sampling | None, confidence: float = 0.0, cost: float = 0.0, ahead=None,
++          after_absorb=None) -> list[int]:
+     """Absorb kept rows and chain drafts, always retaining the first even below ``confidence``, then stopping before later drafts below it or after a low-confidence first draft.
+ 
+     ``cost`` > 0 (tokens per ms) also stops before a later draft whose chance of being reached and kept, the product
+     of the head's probabilities of drafts 1..j, is under its bar (``cost_bars``): a long chain of middling drafts
+     costs verify rows it rarely repays. The MTP step of a draft the product already fails is skipped (products only
+     fall). Speed only: drafts never change the output. ``ahead`` (decode_ahead.Rows, key 0): each draft's n-gram
+-    pages are asked for once the next MTP step is launched (residency only)."""
++    pages are asked for once the next MTP step is launched (residency only). ``after_absorb``: host work run right
++    after the absorb step is launched, while it is on the GPU (the lone stream's commit, TF_ABSORB_FIRST)."""
+ 
+     st = e.st
++    prof = PROFILE
+     logits = absorb(e, streams, next_tokens)
++    if prof is not None:
++        prof.mark("absorb launch*")
++    if after_absorb is not None:
++        after_absorb()
+     if ahead is not None:
+         ahead.send()                                     # row 0 while the absorb step runs
+     drafts: list[int] = []
+@@ -284,6 +292,9 @@ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position
+     chain = 1.0
+     for j in range(count):
+         low = False
++        if prof is not None:
++            prof.ready(getattr(e.graphs, "mtp_evt", None))
++            prof.mark("absorb gpu" if j == 0 else "draft gpu")
+         if confidence > 0 or bars is not None:
+             d, p = e.sample_draft(logits, position + j, sampling)
+             chain *= p
+@@ -305,8 +316,12 @@ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position
+             st.set_mtp_len(st.mtp_len + 1)
+             st.mtp_drafted += 1
+             next_tokens = [d]
++            if prof is not None:
++                prof.mark("draft pick+launch*")
+     if ahead is not None:
+         ahead.send()
++    if prof is not None:
++        prof.mark("last pick*")
+     return drafts
+ 
+ 
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/graphs.py b/src/tensorfold/families/qwen4_exp/cuda/graphs.py
+index 2fc86932..b781a51b 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/graphs.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/graphs.py
+@@ -7,6 +7,7 @@ import torch
+ from .forward import compute, stage
+ from .heads import launch_key
+ from .mtp import mtp_compute, mtp_stage
++from .roundprof import PROFILE
+ 
+ 
+ class Graphs:
+@@ -18,6 +19,8 @@ class Graphs:
+         self.mtp_out: dict[tuple, torch.Tensor] = {}
+         self.pool = torch.cuda.graph_pool_handle()
+         self.captures = 0
++        self.main_evt = torch.cuda.Event() if PROFILE is not None else None     # TF_ROUND_PROFILE: replay ends
++        self.mtp_evt = torch.cuda.Event() if PROFILE is not None else None
+ 
+     def _capture(self, fn) -> torch.cuda.CUDAGraph:
+         import gc
+@@ -60,6 +63,9 @@ class Graphs:
+             g = self._capture(lambda: compute(w, segs, b, context=context))
+             self.main[key] = g
+         g.replay()
++        evt = getattr(self, "main_evt", None)            # tests build Graphs without __init__
++        if evt is not None:
++            evt.record()
+         return b.logits[:R]
+ 
+     @torch.no_grad()
+@@ -79,6 +85,9 @@ class Graphs:
+             self.mtp[key] = g
+             self.mtp_out[key] = out
+         g.replay()
++        evt = getattr(self, "mtp_evt", None)
++        if evt is not None:
++            evt.record()
+         return self.mtp_out[key]
+ 
+     @torch.no_grad()
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/multi_solo.py b/src/tensorfold/families/qwen4_exp/cuda/multi_solo.py
+index 892fb24c..23d3b4a3 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/multi_solo.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/multi_solo.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import time
+ 
+ import torch
+@@ -14,8 +15,14 @@ from tensorfold.cuda.streams import Stream, accept
+ from . import decode_ahead
+ from .decode import Engine, draft
+ from .forward import commit
++from .roundprof import PROFILE
+ from .state import Buffers
+ 
++# TF_ABSORB_FIRST (default on): a lone stream's MTP absorb launches before the verify's commit, so commit's host work
++# (a DeltaNet replay launch per layer when a draft was rejected) runs while the absorb step is on the GPU. The same
++# kernels on the same data in another order: the absorb neither reads nor writes what commit does. =0: commit first.
++ABSORB_FIRST = os.environ.get("TF_ABSORB_FIRST", "1").strip().lower() not in ("0", "off", "false", "no")
++
+ 
+ def solo(w, st, capacity, depth, pbuf, timing=None):
+     from .graphs import Graphs
+@@ -209,33 +216,58 @@ class Alone:
+ 
+         e, st = self.solo, s.st
+         self.solo_rounds = getattr(self, "solo_rounds", 0) + 1      # house: tests count graph-slot rounds
++        prof = PROFILE
++        if prof is not None:
++            prof.start()
+         t0 = time.perf_counter()
+         tokens = [s.out[-1]] + list(s.drafts)
+         R = len(tokens)
+         logits = e.forward(tokens)
++        if prof is not None:
++            prof.mark("stage+launch*")
++            prof.ready(getattr(e.graphs, "main_evt", None))
++            prof.mark("main gpu")
+         rows = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], s.sampling)
+         path, end = accept(tokens, list(range(-1, R - 1)), rows, s.count - len(s.out), self._ends(s))
+         if s.probabilities is not None:
+             capture(logits, [tokens[r] for r in path[1:]] + [end],
+                     [st.pos + 1 + r for r in path], s.probabilities, rows=path)
+-        commit(self.w, st, e.buf, R, len(path))
+-        s.committed.extend(tokens[:len(path)])
+-        s.counted(R)
++        if prof is not None:
++            prof.mark("sample+accept*")
++        keep = len(path)
+         new = [tokens[r] for r in path[1:]] + [end]
+         last = len(s.out) + len(new) >= s.count or end in self._ends(s)
+-        s.drafts = []
+-        room = min(self.depth, s.count - len(s.out) - len(path))
++        room = min(self.depth, s.count - len(s.out) - keep)
+         # D4: the next window's n-gram pages are asked for row by row while the draft chain runs (residency only)
+         ahead = decode_ahead.rows(self.w) if not last and getattr(self.w, "comm", None) is None else None
+-        decode_ahead.start(ahead, [(0, st, end)])
+-        if not last and room > 0:
++
++        def kept() -> None:
++            """Commit the kept rows, then ask for the next window's n-gram pages (they read the new history)."""
++
++            commit(self.w, st, e.buf, R, keep)
++            if prof is not None:
++                prof.mark("commit*")
++            decode_ahead.start(ahead, [(0, st, end)])
++
++        s.committed.extend(tokens[:keep])
++        s.counted(R)
++        s.drafts = []
++        drafting = not last and room > 0
++        first = drafting and ABSORB_FIRST
++        if not first:
++            kept()
++        if drafting:
+             more = {"cost": self.cost} if self.cost > 0 else {}
+             if ahead is not None:
+                 more["ahead"] = ahead
+-            s.drafts = draft(e, e.buf.streams[:len(path)], rows[:len(path)], st.pos + 1, room, s.sampling,
+-                             self.confidence, **more)
++            if first:      # the MTP absorb reads none of what commit writes (its own cache, length and buffers)
++                more["after_absorb"] = kept
++            s.drafts = draft(e, e.buf.streams[:keep], rows[:keep], st.pos + 1 + (keep if first else 0), room,
++                             s.sampling, self.confidence, **more)
+         elif ahead is not None:
+             ahead.send()
+         s.take(new, self._ends(s))
+         self._timed(time.perf_counter() - t0, 0)    # a prompt arriving next sizes its passes by this round's time
++        if prof is not None:
++            prof.end(len(s.drafts))
+         return [s] if s.done else []
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/roundprof.py b/src/tensorfold/families/qwen4_exp/cuda/roundprof.py
+new file mode 100644
+index 00000000..acaad104
+--- /dev/null
++++ b/src/tensorfold/families/qwen4_exp/cuda/roundprof.py
+@@ -0,0 +1,64 @@
++"""TF_ROUND_PROFILE=1: where a lone stream's decode round spends host time while the GPU waits (the done line's graph
++summary cannot split it). Marks are host clock readings at fixed points of the round; ``ready`` marks wait on an event
++recorded right after a graph's replay, so ``ready -> next launch`` is host time with nothing queued on the GPU. Every
++``TF_ROUND_PROFILE_EVERY`` rounds (default 400) the means per round are printed and reset. Off: no events, no syncs."""
++
++from __future__ import annotations
++
++import os
++import time
++
++ON = os.environ.get("TF_ROUND_PROFILE", "").strip() == "1"
++EVERY = int(os.environ.get("TF_ROUND_PROFILE_EVERY", "400") or 400)
++
++# phases, in round order (host stretches marked *, the GPU idles through them)
++PHASES = ("loop*", "stage+launch*", "main gpu", "sample+accept*", "commit*", "absorb launch*", "absorb gpu",
++          "draft pick+launch*", "draft gpu", "last pick*", "tail*")
++
++
++class Profile:
++    def __init__(self) -> None:
++        self.sums = dict.fromkeys(PHASES, 0.0)
++        self.rounds = 0
++        self.drafts = 0
++        self.last_end: float | None = None
++        self.t = 0.0
++        self.active = False                  # inside a lone round: draft() also runs in shared rounds and prefill
++
++    def ready(self, event) -> None:
++        """Wait for the graph whose replay recorded ``event`` (the caller's next read would wait for it anyway)."""
++
++        if event is not None and self.active:
++            event.synchronize()
++
++    def start(self) -> None:
++        now = time.perf_counter()
++        if self.last_end is not None and now - self.last_end < 0.05:     # a gap of a following round, not idle time
++            self.sums["loop*"] += now - self.last_end
++        self.t = now
++        self.active = True
++
++    def mark(self, phase: str) -> None:
++        if not self.active:
++            return
++        now = time.perf_counter()
++        self.sums[phase] += now - self.t
++        self.t = now
++
++    def end(self, drafts: int) -> None:
++        self.mark("tail*")
++        self.active = False
++        self.last_end = self.t
++        self.rounds += 1
++        self.drafts += drafts
++        if self.rounds >= EVERY:
++            n = self.rounds
++            host = sum(v for k, v in self.sums.items() if k.endswith("*"))
++            parts = " ".join(f"{k}={v / n * 1e3:.3f}" for k, v in self.sums.items())
++            print(f"[tensorfold] round profile ({n} lone rounds, {self.drafts / n:.2f} drafts/round, ms/round): "
++                  f"{parts} host_total={host / n * 1e3:.3f}", flush=True)
++            self.sums = dict.fromkeys(PHASES, 0.0)
++            self.rounds = self.drafts = 0
++
++
++PROFILE = Profile() if ON else None
+-- 
+2.43.0
+

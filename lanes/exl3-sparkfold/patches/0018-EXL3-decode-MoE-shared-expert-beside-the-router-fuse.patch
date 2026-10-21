@@ -1,0 +1,580 @@
+From bd2a732eb58edeb42b33b731378d9c8c5f272584 Mon Sep 17 00:00:00 2001
+From: dolf3131 <144650661+dolf3131@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 11:42:11 +0900
+Subject: [PATCH] EXL3 decode MoE: shared expert beside the router, fused
+ expert epilogues (TF_MOE_SPLIT)
+
+A decode window's MoE block was router -> select_group -> rot_in -> grouped gate|up -> gateup_epilogue ->
+grouped down -> down_epilogue on one stream, the shared expert grouped with the routed ones, and the router
+(17 programs) leaving most SMs idle while nothing else could start.
+
+- The shared expert needs only x: shared_part streams it on a side stream (rot_in, gate|up, down into its slot
+  of Y) beside the router, its top-k and the routed experts, joined before the write-back.
+- route_split / routed_split: the shared expert out of the groups and of rot_in (its slot keeps its pick and
+  weight); gate|up's epilogue run by the last of each (expert, 128-column block)'s programs, down's (one split)
+  straight from the warp sums: two launches fewer, the same arithmetic in the same order.
+- grouped_kernel: an expert's n blocks are grid neighbours (its words stream together); decode windows (at most
+  8 members an expert) keep an 8-row reduction buffer (half the shared memory).
+TF_MOE_SPLIT=0 keeps the previous path. Extension renamed experts_v10m.
+
+Same bits: deployed vs new on the pack's tables, rows 1-8, 96 comparisons (and picks, weights, counters left
+zero); new cut-model test (verify windows 1-64 rows, logits/picks/weights, split on vs off) and the draft tests
+with and without CUDA graphs pass; 201 EXL3/expert tests pass. Lab MoE block: 1 row -7.0%, 2 -6.5%, 4 -5.1%,
+7 -4.2%. Live A/B (14 identical replies): +1.3..+3.8% tok/s, mean +1.75%.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/tensorfold/cuda/exl3/experts.cpp          |  29 +++
+ src/tensorfold/cuda/exl3/experts.cu           |  39 ++++
+ src/tensorfold/cuda/exl3/experts.py           |  87 ++++++++-
+ src/tensorfold/cuda/exl3/experts_grouped.cuh  | 169 ++++++++++++++++--
+ .../families/qwen4_exp/cuda/forward.py        |  16 +-
+ tests/cuda/test_moe_route_fused.py            |  46 +++++
+ 6 files changed, 371 insertions(+), 15 deletions(-)
+
+diff --git a/src/tensorfold/cuda/exl3/experts.cpp b/src/tensorfold/cuda/exl3/experts.cpp
+index e89a52b8..78171487 100644
+--- a/src/tensorfold/cuda/exl3/experts.cpp
++++ b/src/tensorfold/cuda/exl3/experts.cpp
+@@ -40,6 +40,34 @@ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
+                 ": expected a contiguous CUDA tensor of the right dtype");
+ }
+ 
++void exl3x_grouped_epi_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                            const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                            const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
++                            int64_t, int64_t, int64_t, int64_t, at::Tensor&, const at::Tensor&, const at::Tensor&,
++                            const at::Tensor&, at::Tensor&, at::Tensor&, double, int64_t);
++
++// grouped with gateup_epilogue (epi 1: xd) or down_epilogue (epi 2: y) fused: decode windows, mul1, tiles (8, 4, 1).
++void grouped_epi(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
++                 const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
++                 const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK,
++                 int64_t slots, int64_t cb, int64_t lo, int64_t hi, int64_t epi, at::Tensor counters,
++                 const at::Tensor& svh0, const at::Tensor& svh1, const at::Tensor& suh_d, at::Tensor xd, at::Tensor y,
++                 double limit, int64_t act) {
++    check(X0, at::kHalf, "X0");
++    check(X1, at::kHalf, "X1");
++    check(members, at::kInt, "members");
++    check(counters, at::kInt, "counters");
++    check(xd, at::kHalf, "xd");
++    check(y, at::kFloat, "y");
++    TORCH_CHECK(epi == 1 || epi == 2, "epi 1 (gate|up) or 2 (down)");
++    TORCH_CHECK(Z.numel() >= mats * SK * P * N || epi == 2, "Z too small");
++    TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
++    TORCH_CHECK(epi == 1 ? xd.numel() >= P * N : y.numel() >= P * N, "output too small");
++    c10::cuda::CUDAGuard guard(X0.device());
++    exl3x_grouped_epi_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb, lo, hi, epi,
++                           counters, svh0, svh1, suh_d, xd, y, limit, act);
++}
++
+ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
+              const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
+              const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK,
+@@ -256,6 +284,7 @@ void select_group(const at::Tensor& logits, at::Tensor pick, at::Tensor wts, at:
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("grouped", &grouped);
++    m.def("grouped_epi", &grouped_epi);
+     m.def("grouped_items", &grouped_items);
+     m.def("prompt", &prompt);
+     m.def("prompt_down", &prompt_down);
+diff --git a/src/tensorfold/cuda/exl3/experts.cu b/src/tensorfold/cuda/exl3/experts.cu
+index 122ab9a2..a04343aa 100644
+--- a/src/tensorfold/cuda/exl3/experts.cu
++++ b/src/tensorfold/cuda/exl3/experts.cu
+@@ -568,6 +568,45 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
++// grouped with a fused epilogue (decode windows, mul1, (8, 4, 1)): epi 1 gate|up -> xd (gateup_epilogue's bits), epi 2
++// one-split down -> y (down_epilogue's bits).
++void exl3x_grouped_epi_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
++                            const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
++                            const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
++                            int64_t SK, int64_t slots, int64_t cb, int64_t lo, int64_t hi, int64_t epi,
++                            at::Tensor& counters, const at::Tensor& svh0, const at::Tensor& svh1,
++                            const at::Tensor& suh_d, at::Tensor& xd, at::Tensor& y, double limit, int64_t act) {
++    TORCH_CHECK(cb == 2, "fused expert epilogues: mul1 only");
++    TORCH_CHECK(K % (16 * SK * 4) == 0 && N % 128 == 0, "K and N must split evenly");
++    TORCH_CHECK(epi != 1 || counters.numel() >= uids.size(0) * (N / 128) * ((members.size(1) + 15) / 16),
++                "counters too small");
++    tf_exl3x::GroupedArgs a;
++    a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
++    a.x1 = reinterpret_cast<const half*>(X1.data_ptr());
++    a.tp0 = TP0.data_ptr<int64_t>();
++    a.tp1 = TP1.data_ptr<int64_t>();
++    a.k2_0 = B0.data_ptr<int>();
++    a.k2_1 = B1.data_ptr<int>();
++    a.uids = uids.data_ptr<int>();
++    a.ucount = ucount.data_ptr<int>();
++    a.members = members.data_ptr<int>();
++    a.z = Z.data_ptr<float>();
++    a.K = (int)K; a.N = (int)N; a.P = (int)P; a.SK = (int)SK; a.maxm = (int)members.size(1); a.slots = (int)slots;
++    a.nexp_max = (int)uids.size(0);
++    a.mats = (int)mats; a.nt = 8; a.warps = 4; a.pf = 1; a.lo = (int)lo; a.hi = (int)hi;
++    a.epi = (int)epi;
++    a.ep.counters = counters.data_ptr<int>();
++    a.ep.svh0 = reinterpret_cast<const half*>(svh0.data_ptr());
++    a.ep.svh1 = reinterpret_cast<const half*>(svh1.data_ptr());
++    a.ep.suh_d = reinterpret_cast<const half*>(suh_d.data_ptr());
++    a.ep.xd = reinterpret_cast<half*>(xd.data_ptr());
++    a.ep.y = y.data_ptr<float>();
++    a.ep.limit = (float)limit;
++    a.ep.act = (int)act;
++    tf_exl3x::grouped_launch<2>(a, at::cuda::getCurrentCUDAStream());
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
+ void exl3x_grouped_items_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0,
+                               const at::Tensor& TP1, const at::Tensor& B0, const at::Tensor& B1,
+                               const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& Z,
+diff --git a/src/tensorfold/cuda/exl3/experts.py b/src/tensorfold/cuda/exl3/experts.py
+index bb822ce8..888cae20 100644
+--- a/src/tensorfold/cuda/exl3/experts.py
++++ b/src/tensorfold/cuda/exl3/experts.py
+@@ -31,7 +31,7 @@ def _ext():
+ 
+     here = Path(__file__).parent
+     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
+-    return load(name="tensorfold_exl3_experts_v9x", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
++    return load(name="tensorfold_exl3_experts_v10m", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+                 verbose=False)
+ 
+ 
+@@ -178,11 +178,40 @@ class Scratch:
+         self.ids = torch.zeros((maxu,), dtype=torch.int32, device=device)
+         self.count = torch.zeros((1,), dtype=torch.int32, device=device)
+         self.route_done = torch.zeros((1,), dtype=torch.int32, device=device)   # route(): rows done (reset by the last)
++        self.split_rows = 0
++        if SPLIT and ex.count >= 2 and str(device) != "cpu":
++            self._split_buffers(ex, min(rows, ROUTE_ROWS), slots, device)
+         self.members_buf = torch.full((maxu * rows,), -1, dtype=torch.int32, device=device)
+         self.rows, self.slots, self.count_experts = rows, slots, ex.count
+         self.device = device
+         self._plan = None          # prompt windows: pairs grouped into items (``plan``), made on first use
+ 
++    def _split_buffers(self, ex: Exl3RoutedExperts, rows: int, slots: int, device) -> None:
++        """The split path's own buffers (``shared_part`` on ``side``; ``routed_split``'s epilogue counters)."""
++
++        D, I = ex.dims, ex.width
++        P = rows * slots
++        shared = ex.count - 1
++        self.split_rows = rows
++        self.side = torch.cuda.Stream(device=device)
++        self.xg_sh = torch.zeros((P, D), dtype=torch.float16, device=device)
++        self.xu_sh = torch.zeros((P, D), dtype=torch.float16, device=device)
++        self.xd_sh = torch.zeros((P, I), dtype=torch.float16, device=device)
++        self.z_sh = torch.zeros((2 * self.cfg_gu[2] * I * P,), dtype=torch.float32, device=device)
++        self.pick_sh = torch.full((rows, slots), -1, dtype=torch.int32, device=device)
++        self.pick_sh[:, slots - 1] = shared                       # the shared expert's slot, every row
++        self.ids_sh = torch.full((1,), shared, dtype=torch.int32, device=device)
++        self.cnt_sh = torch.ones((1,), dtype=torch.int32, device=device)
++        self.mem_sh = torch.tensor([r * 32 + slots - 1 for r in range(rows)], dtype=torch.int32, device=device)
++        mt = (rows + 15) // 16
++        self.counters_r = torch.zeros((min(P, ex.count) * (I // 128) * mt,), dtype=torch.int32, device=device)
++        self.counters_sh = torch.zeros(((I // 128) * mt,), dtype=torch.int32, device=device)
++        g, u, d = ex.gate_k2.tolist(), ex.up_k2.tolist(), ex.down_k2.tolist()
++        self.k2_r_gu = (min(g[:-1] + u[:-1]), max(g[:-1] + u[:-1])) if shared else (8, 8)
++        self.k2_r_d = (min(d[:-1]), max(d[:-1])) if shared else (8, 8)
++        self.k2_sh_gu = (min(g[-1], u[-1]), max(g[-1], u[-1]))
++        self.k2_sh_d = (d[-1], d[-1])
++
+     def plan(self):
+         """A prompt plan over this scratch's rows (tensorfold.cuda.experts' grouping: items of one expert's next pairs,
+         pair order) with one more expert than the layer's, so skipped picks (== E) group apart and are skipped."""
+@@ -278,6 +307,10 @@ ROUTE_FUSED = _ROUTE != "0"
+ # -> 2. "single": all three in one grid (route_kernel; redoes each pair's top-k: measured slower, kept for the bench).
+ ROUTE_SINGLE = _ROUTE == "single"
+ ROUTE_ROWS = env_rows("TF_MOE_ROUTE_ROWS", 64)
++# TF_MOE_SPLIT=1 (default; 0 off): a decode window (route_ok, mul1, tiles (8, 4, 1)/(8, 4, 1, 1)) runs the shared
++# expert apart on a side stream beside the router (shared_part) and the routed experts with their epilogues fused into
++# the grouped kernels (route_split + routed_split): the same Y bits, two launches and the router's idle SMs fewer.
++SPLIT = env_choice("TF_MOE_SPLIT", "1") == "1"
+ 
+ 
+ def route_ok(R: int, x: torch.Tensor, ex: Exl3RoutedExperts, s: Scratch, top_k: int, experts: int,
+@@ -304,6 +337,58 @@ def route(logits: torch.Tensor, x: torch.Tensor, pick: torch.Tensor, wts: torch.
+     _ext().rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, ex.dims, s.slots, ex.count, False)
+ 
+ 
++def split_ok(R: int, x: torch.Tensor, ex: Exl3RoutedExperts, s: Scratch, top_k: int, experts: int) -> bool:
++    """Whether a decode window takes the split path: the shared expert (the table's last, slot top_k) apart beside the
++    router, the routed experts with their epilogues fused (TF_MOE_SPLIT; the same bits as route + routed)."""
++
++    return (SPLIT and 0 < R <= s.split_rows and route_ok(R, x, ex, s, top_k, experts) and ex.cb == CB_MUL1
++            and ex.count == experts + 1 and tuple(s.cfg_gu[:2]) == (8, 4) and s.cfg_gu[3] == 1
++            and tuple(s.cfg_d) == (8, 4, 1, 1) and ex.width % 128 == 0 and ex.dims % 128 == 0)
++
++
++def shared_part(x: torch.Tensor, ex: Exl3RoutedExperts, s: Scratch, R: int, limit: float = math.inf,
++                act_mode: int = ACT_F32) -> None:
++    """The shared expert alone: rot_in, gate|up with its epilogue, down with its epilogue, into its rows of s.y (the
++    bits routed() gives that slot). Needs only x: the caller runs it on ``s.side`` beside the router."""
++
++    ext = _ext()
++    D, I, P = ex.dims, ex.width, R * s.slots
++    ext.rot_in(x, x.stride(0), s.pick_sh[:R], ex.suh_g, ex.suh_u, s.xg_sh, s.xu_sh, R, D, s.slots, ex.count, False)
++    mem = s.mem_sh[:R].view(1, R)
++    ext.grouped_epi(s.xg_sh, s.xu_sh, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, s.ids_sh, s.cnt_sh, mem, s.z_sh, 2,
++                    D, I, P, s.cfg_gu[2], s.slots, ex.cb, *s.k2_sh_gu, 1, s.counters_sh, ex.svh_g, ex.svh_u, ex.suh_d,
++                    s.xd_sh, s.y, float(limit), act_mode)
++    ext.grouped_epi(s.xd_sh, s.xd_sh, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, s.ids_sh, s.cnt_sh, mem, s.z_sh,
++                    1, I, D, P, 1, s.slots, ex.cb, *s.k2_sh_d, 2, s.counters_sh, ex.svh_d, ex.svh_d, ex.suh_d,
++                    s.xd_sh, s.y, float(limit), act_mode)
++
++
++def route_split(logits: torch.Tensor, x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor, ex: Exl3RoutedExperts,
++                s: Scratch, R: int, top_k: int, experts: int) -> None:
++    """route() with the shared expert out of the groups and out of rot_in (its slot still gets its pick and weight)."""
++
++    ids, members = s.window(R)
++    _ext().select_group(logits, pick, wts, ids, s.count, members, R, s.slots, experts, top_k, ex.count - 1)
++    _ext().rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, ex.dims, s.slots, ex.count - 1, False)
++
++
++def routed_split(x: torch.Tensor, pick: torch.Tensor, ex: Exl3RoutedExperts, s: Scratch, R: int,
++                 limit: float = math.inf, act_mode: int = ACT_F32) -> torch.Tensor:
++    """The routed experts of a route_split window: gate|up with gateup_epilogue fused, down with down_epilogue fused,
++    into their rows of s.y; with shared_part's rows, Y of every slot (routed()'s bits)."""
++
++    ext = _ext()
++    D, I, P = ex.dims, ex.width, R * s.slots
++    ids, members = s.window(R)
++    ext.grouped_epi(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I, P,
++                    s.cfg_gu[2], s.slots, ex.cb, *s.k2_r_gu, 1, s.counters_r, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, s.y,
++                    float(limit), act_mode)
++    ext.grouped_epi(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I, D,
++                    P, 1, s.slots, ex.cb, *s.k2_r_d, 2, s.counters_r, ex.svh_d, ex.svh_d, ex.suh_d, s.xd, s.y,
++                    float(limit), act_mode)
++    return s.y[:P]
++
++
+ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
+            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
+            group: bool = True, y_out: torch.Tensor | None = None, prepped: bool = False) -> torch.Tensor:
+diff --git a/src/tensorfold/cuda/exl3/experts_grouped.cuh b/src/tensorfold/cuda/exl3/experts_grouped.cuh
+index 405ac458..1de565ed 100644
+--- a/src/tensorfold/cuda/exl3/experts_grouped.cuh
++++ b/src/tensorfold/cuda/exl3/experts_grouped.cuh
+@@ -200,14 +200,46 @@ __host__ __device__ constexpr bool k2_supported(int k2) {
+     return k2 >= 2 && k2 <= 16;
+ }
+ 
+-// Program (expert u, n block, split and member tile): up to 16 members times W_q over the split's K range; warps added in order.
+-template <int CB, int NT, int W, int PF, int LO, int HI>
++// experts.cu's fwht128, 1 / sqrt(128) and bf16 rounding, for the fused epilogues below.
++__device__ __forceinline__ void fwht128g(float (&v)[4], int lane) {
++    float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
++    v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
++#pragma unroll
++    for (int m = 1; m < 32; m <<= 1) {
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            float o = __shfl_xor_sync(0xffffffffu, v[j], m);
++            v[j] = (lane & m) ? o - v[j] : v[j] + o;
++        }
++    }
++}
++constexpr float HAD_SCALE_G = 0.08838834764831845f;
++__device__ __forceinline__ float bf16rg(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
++
++// Fused epilogues (decode windows). EPI 1, gate|up: the last of an (expert, 128-column block, member tile)'s mats * SK
++// programs runs gateup_epilogue_kernel's arithmetic for its rows and columns (xd). EPI 2, down with one split: the
++// warps' sums go through down_epilogue_kernel's arithmetic straight away (y, no Z).
++struct Epi {
++    int* counters;          // EPI 1: one a (expert slot, n block, member tile), left zero
++    const half* svh0;       // EPI 1: svh of gate; EPI 2: svh of down
++    const half* svh1;       // EPI 1: svh of up
++    const half* suh_d;      // EPI 1
++    half* xd;               // EPI 1: [P, N]
++    float* y;               // EPI 2: [P, N]
++    float limit;
++    int act;                // 0: GLM's bf16 roundings, 1: fp32
++};
++
++// Program (n block, expert u, split and member tile): up to 16 members times W_q over the split's K range; warps added
++// in order. An expert's n blocks are neighbours in the grid (launched together: its words stream in order). MR 8:
++// rows 0-7 of a member tile only (decode windows of at most 8 members), half the shared memory.
++template <int CB, int NT, int W, int PF, int LO, int HI, int EPI = 0, int MR = 16>
+ __global__ void __launch_bounds__(W * 32) grouped_kernel(
+     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
+     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
+     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
+-    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
+-    const int u = blockIdx.x;
++    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, const Epi ep = Epi{}) {
++    const int u = blockIdx.y, nbk = blockIdx.x;
+     if (u >= ucount[0]) return;
+     const int MT = (maxm + 15) / 16;
+     const int mtile = blockIdx.z % MT;
+@@ -235,7 +267,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
+ 
+     const int per_split = KT / SK, per_warp = per_split / W;
+     const int kt0 = split * per_split + warp * per_warp;
+-    const int nt0 = blockIdx.y * NT;
++    const int nt0 = nbk * NT;
+ 
+     float acc[NT][2][4];
+ #pragma unroll
+@@ -274,7 +306,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
+     }
+ 
+     // warps' partial sums through shared memory, added in warp order
+-    __shared__ float red[W][16][NT * 16];
++    __shared__ float red[W][MR][NT * 16];
+ #pragma unroll
+     for (int i = 0; i < NT; ++i)
+ #pragma unroll
+@@ -282,11 +314,38 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
+             const int col = i * 16 + h * 8 + 2 * t;
+             red[warp][g][col] = acc[i][h][0];
+             red[warp][g][col + 1] = acc[i][h][1];
+-            red[warp][g + 8][col] = acc[i][h][2];
+-            red[warp][g + 8][col + 1] = acc[i][h][3];
++            if constexpr (MR == 16) {
++                red[warp][g + 8 < MR ? g + 8 : 0][col] = acc[i][h][2];
++                red[warp][g + 8 < MR ? g + 8 : 0][col + 1] = acc[i][h][3];
++            }
+         }
+     __syncthreads();
+-    for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
++    if constexpr (EPI == 2) {
++        static_assert(NT * 16 == 128, "the down epilogue's butterfly spans the program's 128 columns");
++        // down_epilogue_kernel with one split: s = 0, s += the warps' sum; rotate; * HAD_SCALE * svh_d
++        for (int row = warp; row < MR; row += W) {
++            const int r = rows_sh[row];
++            if (r < 0) continue;
++            float v[4];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                const int col = 4 * lane + j;
++                float s = red[0][row][col];
++#pragma unroll
++                for (int w = 1; w < W; ++w) s += red[w][row][col];
++                float acc0 = 0.f;
++                acc0 += s;
++                v[j] = acc0;
++            }
++            fwht128g(v, lane);
++            const int n = nt0 * 16 + 4 * lane;
++            float* o = ep.y + (size_t)r * N + n;
++#pragma unroll
++            for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE_G * __half2float(ep.svh0[(size_t)e * N + n + j]);
++        }
++        return;
++    }
++    for (int idx = threadIdx.x; idx < MR * NT * 16; idx += W * 32) {
+         const int row = idx / (NT * 16), col = idx % (NT * 16);
+         const int r = rows_sh[row];
+         if (r < 0) continue;
+@@ -295,6 +354,58 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
+         for (int w = 1; w < W; ++w) s += red[w][row][col];
+         Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;
+     }
++    if constexpr (EPI == 1) {
++        static_assert(NT * 16 == 128, "the gate|up epilogue's butterflies span the program's 128 columns");
++        __shared__ int last;
++        __threadfence();
++        __syncthreads();
++        int* cnt = ep.counters + ((size_t)u * gridDim.x + nbk) * MT + mtile;
++        if (threadIdx.x == 0) last = atomicAdd(cnt, 1) == 2 * SK - 1;
++        __syncthreads();
++        if (!last) return;
++        __threadfence();
++        // gateup_epilogue_kernel for (pair r, this 128-column block), one warp a member row
++        for (int row = warp; row < MR; row += W) {
++            const int r = rows_sh[row];
++            if (r < 0) continue;
++            const int n = nt0 * 16 + 4 * lane;
++            float gv[4], uv[4];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                float sg = 0.f, su = 0.f;
++                for (int s = 0; s < SK; ++s) {
++                    sg += __ldcg(Z + ((size_t)(0 * SK + s) * P + r) * N + n + j);
++                    su += __ldcg(Z + ((size_t)(1 * SK + s) * P + r) * N + n + j);
++                }
++                gv[j] = sg;
++                uv[j] = su;
++            }
++            fwht128g(gv, lane);
++            fwht128g(uv, lane);
++            float v[4];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                float act;
++                if (ep.act == 0) {
++                    float gg = fminf(bf16rg(gv[j] * HAD_SCALE_G * __half2float(ep.svh0[(size_t)e * N + n + j])), ep.limit);
++                    float uu = fminf(fmaxf(bf16rg(uv[j] * HAD_SCALE_G * __half2float(ep.svh1[(size_t)e * N + n + j])),
++                                           -ep.limit), ep.limit);
++                    act = bf16rg(bf16rg(gg / (1.f + expf(-gg))) * uu);
++                } else {
++                    float gg = fminf(gv[j] * HAD_SCALE_G * __half2float(ep.svh0[(size_t)e * N + n + j]), ep.limit);
++                    float uu = fminf(fmaxf(uv[j] * HAD_SCALE_G * __half2float(ep.svh1[(size_t)e * N + n + j]), -ep.limit),
++                                     ep.limit);
++                    act = gg / (1.f + expf(-gg)) * uu;
++                }
++                v[j] = act * __half2float(ep.suh_d[(size_t)e * N + n + j]);
++            }
++            fwht128g(v, lane);
++            half* o = ep.xd + (size_t)r * N + n;
++#pragma unroll
++            for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE_G);
++        }
++        if (threadIdx.x == 0) *cnt = 0;                // every program of the block has arrived
++    }
+ }
+ 
+ // One warp's k tiles for up to MTB member tiles of one expert: each tile decoded once, then MMA'd against every member
+@@ -508,16 +619,48 @@ struct GroupedArgs {
+     int items_max = 0;
+     int mtb = 1;
+     int E = 0;
++    int epi = 0;            // grouped_launch: 1 gate|up epilogue fused, 2 down epilogue fused (mul1, (8, 4, 1))
++    Epi ep{};
+ };
+ 
+ template <int CB>
+ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
+     const int MT = (a.maxm + 15) / 16;
+-    dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MT));
++    dim3 grid((unsigned)(a.N / (16 * a.nt)), (unsigned)a.nexp_max, (unsigned)(a.mats * a.SK * MT));
++    const bool mr8 = a.maxm <= 8;               // a decode window: at most 8 members an expert
++    if (a.epi) {
++        TORCH_CHECK(CB == 2 && a.nt == 8 && a.warps == 4 && a.pf == 1 && (a.epi == 1 ? a.mats == 2 : a.mats == 1 && a.SK == 1),
++                    "fused expert epilogues: mul1 at (8, 4, 1), gate|up or one-split down");
++        if constexpr (CB == 2) {
++#define TF_EPI(EPI_, MR_, LO_, HI_)                                                                             \
++            do {                                                                                                \
++                grouped_kernel<CB, 8, 4, 1, LO_, HI_, EPI_, MR_><<<grid, 128, 0, stream>>>(                       \
++                    a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P,     \
++                    a.SK, a.maxm, a.slots, a.ep);                                                               \
++            } while (0)
++#define TF_EPI_R(EPI_, MR_)                                                                                     \
++            if (a.lo == 8 && a.hi == 8) TF_EPI(EPI_, MR_, 8, 8);                                                \
++            else if (a.lo >= 2 && a.hi <= 10) TF_EPI(EPI_, MR_, 2, 10);                                         \
++            else TF_EPI(EPI_, MR_, 2, 16);
++            if (a.epi == 1) {
++                if (mr8) { TF_EPI_R(1, 8) } else { TF_EPI_R(1, 16) }
++            } else {
++                if (mr8) { TF_EPI_R(2, 8) } else { TF_EPI_R(2, 16) }
++            }
++#undef TF_EPI_R
++#undef TF_EPI
++        }
++        return;
++    }
+ #define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
+-    grouped_kernel<CB, NT_, W_, PF_, LO_, HI_><<<grid, W_ * 32, 0, stream>>>(                                   \
+-        a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm, \
+-        a.slots)
++    do {                                                                                                        \
++        if (mr8) grouped_kernel<CB, NT_, W_, PF_, LO_, HI_, 0, 8><<<grid, W_ * 32, 0, stream>>>(                \
++            a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK,   \
++            a.maxm, a.slots);                                                                                   \
++        else grouped_kernel<CB, NT_, W_, PF_, LO_, HI_, 0, 16><<<grid, W_ * 32, 0, stream>>>(                   \
++            a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK,   \
++            a.maxm, a.slots);                                                                                   \
++    } while (0)
+ #define TF_RANGES(NT_, W_, PF_)                                                                                 \
+     if (a.lo == 8 && a.hi == 8) TF_LAUNCH(NT_, W_, PF_, 8, 8);                                                  \
+     else if (a.lo >= 2 && a.hi <= 10) TF_LAUNCH(NT_, W_, PF_, 2, 10);                                           \
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/forward.py b/src/tensorfold/families/qwen4_exp/cuda/forward.py
+index 7ac5fe19..85bb88f3 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/forward.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/forward.py
+@@ -269,11 +269,25 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> tuple:
+ def _exl3_moe(m, w: Weights, b: Buffers, R: int) -> tuple:
+     """Routed and shared experts on the grouped EXL3 kernel in windows (rows are independent); prompts keep bf16 slots."""
+ 
+-    from tensorfold.cuda.exl3.experts import route, route_ok, routed
++    from tensorfold.cuda.exl3.experts import route, route_ok, route_split, routed, routed_split, shared_part, split_ok
+ 
+     from .exl3_pack import MOE_WINDOW
+ 
+     buf = b.moe
++    s = w.x3.moe
++    if not b.prefill and split_ok(R, b.mixed, m.experts, s, w.cfg.top_k, w.cfg.experts):
++        # TF_MOE_SPLIT: the shared expert needs only x, so it streams on a side stream while the router, its top-k and
++        # the routed experts run here; both write their own slots of Y (the bits of route + routed)
++        main = torch.cuda.current_stream()
++        s.side.wait_stream(main)
++        with torch.cuda.stream(s.side):
++            shared_part(b.mixed[:R], m.experts, s, R)
++        moe_mod.router(b.mixed[:R], m.router, buf.logits[:R])
++        route_split(buf.logits[:R], b.mixed[:R], buf.pick[:R], buf.wts[:R], m.experts, s, R, w.cfg.top_k,
++                    w.cfg.experts)
++        y = routed_split(b.mixed[:R], buf.pick[:R], m.experts, s, R)
++        main.wait_stream(s.side)
++        return 2, y.view(R, buf.slots, -1), buf.wts[:R]
+     moe_mod.router(b.mixed[:R], m.router, buf.logits[:R])
+     if not b.prefill and route_ok(R, b.mixed, m.experts, w.x3.moe, w.cfg.top_k, w.cfg.experts):
+         # S1-ROUTE: top-k, grouping and rot_in in one launch (TF_MOE_ROUTE_FUSED; the same bits)
+diff --git a/tests/cuda/test_moe_route_fused.py b/tests/cuda/test_moe_route_fused.py
+index 49e9b6f7..c5fa5c09 100644
+--- a/tests/cuda/test_moe_route_fused.py
++++ b/tests/cuda/test_moe_route_fused.py
+@@ -247,6 +247,7 @@ def test_cut_model_verify_windows_are_bit_identical(cut_model, monkeypatch):
+         return real_route(*a, **k)
+ 
+     monkeypatch.setattr(experts, "route", spy)
++    monkeypatch.setattr(experts, "SPLIT", False)                  # TF_MOE_SPLIT takes these windows otherwise
+     runs = {}
+     for mode in ("off", "two", "off", "two", "single"):
+         fused = mode != "off"
+@@ -273,6 +274,51 @@ def test_cut_model_verify_windows_are_bit_identical(cut_model, monkeypatch):
+                                rlg.view(torch.int16) if rlg.element_size() == 2 else rlg.view(torch.int32))
+ 
+ 
++@needs_model
++def test_cut_model_split_windows_are_bit_identical(cut_model, monkeypatch):
++    """TF_MOE_SPLIT (shared expert on a side stream, epilogues fused into the grouped kernels) against route + routed:
++    verify-shaped windows (1..64 rows) after a real prompt, logits and the last layer's picks/weights."""
++
++    from tensorfold.cuda.exl3 import experts
++    from tensorfold.families.qwen4_exp.cuda.decode import Engine
++    from tensorfold.families.qwen4_exp.cuda.forward import commit, forward
++
++    w = cut_model
++    assert w.x3.moe.split_rows > 0, "the scratch has no split buffers"
++    toks = [int(t) for t in np.random.default_rng(23).integers(0, w.cfg.vocab, size=400)]
++    used = []
++    real = experts.routed_split
++
++    def spy(*a, **k):
++        used.append(a[4])
++        return real(*a, **k)
++
++    monkeypatch.setattr(experts, "routed_split", spy)
++    runs = {}
++    for split in (False, True, False, True):
++        monkeypatch.setattr(experts, "SPLIT", split)
++        e = Engine(w, capacity=1024, max_rows=64, prefill_rows=128, graphs=False)
++        e.reset()
++        out, at = [], 0
++        for rows in (1, 2, 3, 4, 6, 8, 11, 16, 33, 64, 3, 2, 1, 5):
++            chunk = toks[at:at + rows]
++            out.append((forward(w, e.st, e.buf, chunk)[:rows].clone(), e.buf.moe.pick[:rows].clone(),
++                        e.buf.moe.wts[:rows].clone()))
++            commit(w, e.st, e.buf, rows, max(1, rows - 1))
++            at += max(1, rows - 1)
++        torch.cuda.synchronize()
++        runs.setdefault(split, []).append(out)
++        del e
++    assert used and max(used) > 8, "the split path never ran (or only for small windows)"
++    assert int(w.x3.moe.counters_r.abs().sum()) == 0 and int(w.x3.moe.counters_sh.abs().sum()) == 0
++    ref = runs[False][0]
++    for out in runs[False][1:] + runs[True]:
++        for (lg, pk, wt), (rlg, rpk, rwt) in zip(out, ref):
++            assert torch.equal(pk, rpk) and torch.equal(wt.view(torch.int32), rwt.view(torch.int32))
++            assert torch.equal(lg.view(torch.int16) if lg.element_size() == 2 else lg.view(torch.int32),
++                               rlg.view(torch.int16) if rlg.element_size() == 2 else rlg.view(torch.int32))
++
++
+ @needs_model
+ @pytest.mark.parametrize("graphs", [False, True])
+ def test_cut_model_drafts_emit_serial_tokens_fused_and_not(cut_model, monkeypatch, graphs):
+-- 
+2.43.0
+

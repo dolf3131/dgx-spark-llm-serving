@@ -14,7 +14,8 @@
 #   MODELS_DIR  the directory holding the pack, mounted read-only at /models   (default ~/models; pack at $MODELS_DIR/qwen3.8-flash-next-exl3-4.05bpw)
 #   CACHE       extension builds, Triton cache, the converted vision file and the NVMe spill (default ~/.cache/tensorfold-sparkfold)
 #   HF_CACHE    Hugging Face cache (default ~/.cache/huggingface)
-#   IMAGE       the container image (default tensorfold-qwen38:v0.3.6.3, built by MiaAI-Lab's scripts/prepare.sh)
+#   IMAGE       the container image (default tensorfold-qwen38:v0.3.6.3-xgrammar = MiaAI-Lab's tensorfold-qwen38:v0.3.6.3 plus xgrammar,
+#               xgrammar/Dockerfile; IMAGE=tensorfold-qwen38:v0.3.6.3 runs without structured output)
 #   NET         docker network (default bridge)
 #   BIND        host address the port is published on (default 127.0.0.1; BIND= with an empty value publishes on every interface).
 #               The server has no API key unless you add one: do not expose it to a network you do not trust.
@@ -33,7 +34,7 @@
 # PIN_EXTRA; check that "GiB of pages locked" in the startup line stays near 20-25. The price: the margin to earlyoom's SIGTERM line
 # (3% = 3.6 GiB of MemAvailable on a 121 GiB box) falls from ~11 to ~5 GiB.
 set -euo pipefail
-IMAGE="${IMAGE:-tensorfold-qwen38:v0.3.6.3}"
+IMAGE="${IMAGE:-tensorfold-qwen38:v0.3.6.3-xgrammar}"
 TF_SRC="${TF_SRC:?set TF_SRC to the patched TensorFold tree (../patches/apply.sh builds it)}"
 MODELS_DIR="${MODELS_DIR:-${HOME}/models}"
 MODEL="${MODEL:-/models/qwen3.8-flash-next-exl3-4.05bpw}"
@@ -80,7 +81,7 @@ MEM_ENV=(-e TENSORFOLD_PIN_EXTRA_GIB="${PIN_EXTRA_GIB:-0}")       # 0 = stock lo
 [[ -n "${MEMORY_LIMIT_GB:-}" ]] && MEM_ENV+=(-e TENSORFOLD_MEMORY_LIMIT_GB="${MEMORY_LIMIT_GB}")
 [[ -d "${TF_SRC}/src/tensorfold" ]] || { echo "FATAL: TensorFold sources missing at ${TF_SRC}" >&2; exit 1; }
 [[ -f "${MODELS_DIR}${MODEL#/models}/model.safetensors.index.json" ]] || { echo "FATAL: pack missing under ${MODELS_DIR}" >&2; exit 1; }
-docker image inspect "${IMAGE}" >/dev/null 2>&1 || { echo "FATAL: image ${IMAGE} not present (MiaAI-Lab's scripts/prepare.sh builds it)" >&2; exit 1; }
+docker image inspect "${IMAGE}" >/dev/null 2>&1 || { echo "FATAL: image ${IMAGE} not present (MiaAI-Lab's scripts/prepare.sh builds the base, xgrammar/Dockerfile adds xgrammar)" >&2; exit 1; }
 mkdir -p "${CACHE}/torch_extensions" "${CACHE}/triton"
 
 PUBLISH="${BIND:+${BIND}:}${PORT}:${PORT}"

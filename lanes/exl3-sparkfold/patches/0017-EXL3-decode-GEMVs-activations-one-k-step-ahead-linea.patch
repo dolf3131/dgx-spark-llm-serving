@@ -1,0 +1,135 @@
+From bcc17aa50ba033458d875c0199dcf1a57d2c1979 Mon Sep 17 00:00:00 2001
+From: dolf3131 <144650661+dolf3131@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 10:36:13 +0900
+Subject: [PATCH] EXL3 decode GEMVs: activations one k step ahead;
+ linear_kernel min blocks 1
+
+linear_kernel and grouped warp_tiles loaded each k step's activation fragments right before the mma, so their
+L2 latency sat on every step's critical path (weights were already a step ahead). Load them one step ahead too
+(same values, same mma order). linear_kernel also takes __launch_bounds__(WK * 32, 1): 212 registers at 4 warps
+instead of 167, fewer and faster waves for the split-K shapes. Extensions renamed (linear_v5, experts_v9x) so the
+two trees never share a build.
+
+Same bits: 167 EXL3 linear/expert/tall/route tests pass; deployed vs patched builds on the pack's tensors,
+306 linear + 48 expert-window comparisons, 0 mismatches; live greedy and seeded replies keep their shas.
+Lab, 2 rows: out/o -8%, z -5%, qkv -2%, q -1%, k/v/indexer -18%, MTP fc -8%, expert windows -1%.
+Live A/B (14 identical replies): +1.5..+3.0% tok/s, mean +2.0%.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/tensorfold/cuda/exl3/experts.py          |  2 +-
+ src/tensorfold/cuda/exl3/experts_grouped.cuh | 20 ++++++++++++++++---
+ src/tensorfold/cuda/exl3/linear.cu           | 21 ++++++++++++++------
+ src/tensorfold/cuda/exl3/linear.py           |  2 +-
+ 4 files changed, 34 insertions(+), 11 deletions(-)
+
+diff --git a/src/tensorfold/cuda/exl3/experts.py b/src/tensorfold/cuda/exl3/experts.py
+index 621d8ba9..bb822ce8 100644
+--- a/src/tensorfold/cuda/exl3/experts.py
++++ b/src/tensorfold/cuda/exl3/experts.py
+@@ -31,7 +31,7 @@ def _ext():
+ 
+     here = Path(__file__).parent
+     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
+-    return load(name="tensorfold_exl3_experts_v8r", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
++    return load(name="tensorfold_exl3_experts_v9x", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+                 verbose=False)
+ 
+ 
+diff --git a/src/tensorfold/cuda/exl3/experts_grouped.cuh b/src/tensorfold/cuda/exl3/experts_grouped.cuh
+index 1035ef64..405ac458 100644
+--- a/src/tensorfold/cuda/exl3/experts_grouped.cuh
++++ b/src/tensorfold/cuda/exl3/experts_grouped.cuh
+@@ -152,6 +152,15 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int N
+ #pragma unroll
+             for (int i = 0; i < NT; ++i) load_words<K2>(pf[d][i], tp + d * kstride + i * TW, lane);
+ 
++    // the activations one k step ahead too (the same values; their latency off the mma's path)
++    uint32_t an[4];
++    {
++        const int k = kt0 * 16;
++        an[0] = load_pair(x0 + k, ok0);
++        an[1] = load_pair(x1 + k, ok1);
++        an[2] = load_pair(x0 + k + 8, ok0);
++        an[3] = load_pair(x1 + k + 8, ok1);
++    }
+     for (int ib = 0; ib < nkt; ib += PF) {
+ #pragma unroll
+         for (int d = 0; d < PF; ++d) {
+@@ -166,9 +175,14 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int N
+ #pragma unroll
+                     for (int i = 0; i < NT; ++i)
+                         load_words<K2>(pf[d][i], tp + (size_t)(it + PF) * kstride + i * TW, lane);
+-                const int k = (kt0 + it) * 16;
+-                uint32_t a[4] = {load_pair(x0 + k, ok0), load_pair(x1 + k, ok1), load_pair(x0 + k + 8, ok0),
+-                                 load_pair(x1 + k + 8, ok1)};
++                uint32_t a[4] = {an[0], an[1], an[2], an[3]};
++                if (it + 1 < nkt) {
++                    const int k = (kt0 + it + 1) * 16;
++                    an[0] = load_pair(x0 + k, ok0);
++                    an[1] = load_pair(x1 + k, ok1);
++                    an[2] = load_pair(x0 + k + 8, ok0);
++                    an[3] = load_pair(x1 + k + 8, ok1);
++                }
+ #pragma unroll
+                 for (int i = 0; i < NT; ++i) {
+                     uint32_t b0[2], b1[2];
+diff --git a/src/tensorfold/cuda/exl3/linear.cu b/src/tensorfold/cuda/exl3/linear.cu
+index 6ffd5d9a..9591c857 100644
+--- a/src/tensorfold/cuda/exl3/linear.cu
++++ b/src/tensorfold/cuda/exl3/linear.cu
+@@ -125,8 +125,9 @@ __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x,
+     store4(xh, F16, (size_t)row * K + k, v);
+ }
+ 
++// min blocks 1: the compiler's register budget for 1-16 rows (212 at 4 warps instead of 167: fewer, faster waves)
+ template <int K2, int CB, int WK>
+-__global__ void __launch_bounds__(WK * 32) linear_kernel(
++__global__ void __launch_bounds__(WK * 32, 1) linear_kernel(
+     const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
+     const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
+     float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
+@@ -171,14 +172,22 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
+         constexpr int SR = step_regs<K2>();
+         uint32_t cur[PF ? SR : 1], nxt[PF ? SR : 1];
+         if constexpr (PF) load_step<K2>(tile, lane, cur);
++        // the activations one k step ahead too: the same values, their latency off the mma's path
++        uint32_t an[4];
++        an[0] = __ldg(reinterpret_cast<const uint32_t*>(x0 + kt0 * 16 + 2 * t));
++        an[1] = __ldg(reinterpret_cast<const uint32_t*>(x1 + kt0 * 16 + 2 * t));
++        an[2] = __ldg(reinterpret_cast<const uint32_t*>(x0 + kt0 * 16 + 2 * t + 8));
++        an[3] = __ldg(reinterpret_cast<const uint32_t*>(x1 + kt0 * 16 + 2 * t + 8));
+ #pragma unroll 1
+         for (int i = 0; i < per_warp; ++i) {
+             const int kt = kt0 + i;
+-            uint32_t a[4];
+-            a[0] = __ldg(reinterpret_cast<const uint32_t*>(x0 + kt * 16 + 2 * t));
+-            a[1] = __ldg(reinterpret_cast<const uint32_t*>(x1 + kt * 16 + 2 * t));
+-            a[2] = __ldg(reinterpret_cast<const uint32_t*>(x0 + kt * 16 + 2 * t + 8));
+-            a[3] = __ldg(reinterpret_cast<const uint32_t*>(x1 + kt * 16 + 2 * t + 8));
++            uint32_t a[4] = {an[0], an[1], an[2], an[3]};
++            if (i + 1 < per_warp) {
++                an[0] = __ldg(reinterpret_cast<const uint32_t*>(x0 + (kt + 1) * 16 + 2 * t));
++                an[1] = __ldg(reinterpret_cast<const uint32_t*>(x1 + (kt + 1) * 16 + 2 * t));
++                an[2] = __ldg(reinterpret_cast<const uint32_t*>(x0 + (kt + 1) * 16 + 2 * t + 8));
++                an[3] = __ldg(reinterpret_cast<const uint32_t*>(x1 + (kt + 1) * 16 + 2 * t + 8));
++            }
+             if constexpr (PF) {
+                 if (i + 1 < per_warp) load_step<K2>(tile + (size_t)(i + 1) * stride_k, lane, nxt);
+             }
+diff --git a/src/tensorfold/cuda/exl3/linear.py b/src/tensorfold/cuda/exl3/linear.py
+index 76f29fcf..87f6d7ba 100644
+--- a/src/tensorfold/cuda/exl3/linear.py
++++ b/src/tensorfold/cuda/exl3/linear.py
+@@ -58,7 +58,7 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_exl3_linear_v4", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
++    return load(name="tensorfold_exl3_linear_v5", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
+                 extra_include_paths=[str(here)], extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
+                 verbose=False)
+ 
+-- 
+2.43.0
+
